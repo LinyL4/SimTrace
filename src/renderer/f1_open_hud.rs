@@ -200,13 +200,13 @@ impl<'a> F1OpenHud<'a> {
         }
 
         if capabilities.is_some_and(|value| value.brake) {
-            self.build_trace_layers(brake_bands, BRAKE_COLOR, 1.0, &mut cache.shapes);
+            self.build_trace_layers(brake_bands, BRAKE_COLOR, true, &mut cache.shapes);
         }
         if capabilities.is_some_and(|value| value.throttle) {
-            self.build_trace_layers(throttle_bands, THROTTLE_COLOR, 1.0, &mut cache.shapes);
+            self.build_trace_layers(throttle_bands, THROTTLE_COLOR, true, &mut cache.shapes);
         }
         if capabilities.is_some_and(|value| value.speed) {
-            self.build_trace_layers(speed_bands, SPEED_COLOR, 0.68, &mut cache.shapes);
+            self.build_trace_layers(speed_bands, SPEED_COLOR, false, &mut cache.shapes);
         }
 
         self.build_pedal_meter(
@@ -238,7 +238,7 @@ impl<'a> F1OpenHud<'a> {
         &self,
         bands: [Vec<Pos2>; HISTORY_BANDS],
         color: Color32,
-        strength: f32,
+        primary: bool,
         shapes: &mut Vec<Shape>,
     ) {
         for (band, points) in bands.into_iter().enumerate() {
@@ -246,18 +246,37 @@ impl<'a> F1OpenHud<'a> {
                 continue;
             }
             let recency = (band + 1) as f32 / HISTORY_BANDS as f32;
-            let energy = (0.14 + 0.86 * recency.powf(1.35)) * self.opacity * strength;
+            let energy = (0.08 + 0.92 * recency.powf(1.6)) * self.opacity;
+            let hot = hot_face(color, if primary { 0.76 } else { 0.48 });
+            let (
+                outer_width,
+                outer_alpha,
+                inner_width,
+                inner_alpha,
+                body_width,
+                body_alpha,
+                core_width,
+                core_alpha,
+            ): (f32, f32, f32, f32, f32, f32, f32, f32) = if primary {
+                (10.5, 0.055, 5.5, 0.17, 2.45, 0.88, 0.9, 0.96)
+            } else {
+                (6.0, 0.035, 3.2, 0.09, 1.55, 0.62, 0.6, 0.58)
+            };
             shapes.push(Shape::line(
                 points.clone(),
-                Stroke::new(6.0_f32, with_opacity(color, energy * 0.10)),
+                Stroke::new(outer_width, with_opacity(color, energy * outer_alpha)),
             ));
             shapes.push(Shape::line(
                 points.clone(),
-                Stroke::new(3.2_f32, with_opacity(color, energy * 0.13)),
+                Stroke::new(inner_width, with_opacity(color, energy * inner_alpha)),
+            ));
+            shapes.push(Shape::line(
+                points.clone(),
+                Stroke::new(body_width, with_opacity(color, energy * body_alpha)),
             ));
             shapes.push(Shape::line(
                 points,
-                Stroke::new(1.55_f32, with_opacity(color, energy * 0.94)),
+                Stroke::new(core_width, with_opacity(hot, energy * core_alpha)),
             ));
         }
     }
@@ -740,7 +759,7 @@ impl OpenHudLayout {
         );
         let meter_top = instrument_rect.min.y + outer.height() * 0.15;
         let meter_bottom = instrument_rect.min.y + outer.height() * 0.53;
-        let meter_width = (instrument_rect.width() * 0.12).clamp(8.0, 14.0);
+        let meter_width = (instrument_rect.width() * 0.23).clamp(18.0, 28.0);
         let brake_x = instrument_rect.min.x + instrument_rect.width() * 0.28;
         let throttle_x = instrument_rect.min.x + instrument_rect.width() * 0.72;
         let brake_meter_rect = Rect::from_min_max(
@@ -802,21 +821,27 @@ fn push_luminous_segment(
     state: SegmentState,
     opacity: f32,
 ) {
-    let (body_alpha, glow_alpha, glow_width) = match state {
-        SegmentState::Inactive => (0.045, 0.0, 0.0),
-        SegmentState::Center => (0.30, 0.035, 2.0),
-        SegmentState::Active => (0.82, 0.10, 3.0),
-        SegmentState::Edge => (1.0, 0.15, 4.0),
+    let (body_alpha, inner_alpha, outer_alpha, spread) = match state {
+        SegmentState::Inactive => (0.035, 0.0, 0.0, 0.0),
+        SegmentState::Center => (0.34, 0.07, 0.025, 2.0),
+        SegmentState::Active => (0.88, 0.15, 0.045, 4.0),
+        SegmentState::Edge => (1.0, 0.22, 0.075, 5.0),
     };
     let active = matches!(state, SegmentState::Active | SegmentState::Edge);
+    let hot = hot_face(color, 0.76);
 
     match geometry {
         SegmentGeometry::Rect(rect, rounding) => {
-            if glow_alpha > 0.0 {
+            if outer_alpha > 0.0 {
                 shapes.push(Shape::rect_filled(
-                    rect.expand(glow_width * 0.65),
+                    rect.expand(spread),
+                    rounding + 2.0,
+                    with_opacity(color, opacity * outer_alpha),
+                ));
+                shapes.push(Shape::rect_filled(
+                    rect.expand(spread * 0.42),
                     rounding + 1.0,
-                    with_opacity(color, opacity * glow_alpha),
+                    with_opacity(color, opacity * inner_alpha),
                 ));
             }
             shapes.push(Shape::rect_filled(
@@ -832,14 +857,14 @@ fn push_luminous_segment(
                         Pos2::new(rect.max.x - 1.0, highlight_y),
                     ],
                     Stroke::new(
-                        0.65_f32,
+                        0.8_f32,
                         with_opacity(
-                            Color32::WHITE,
+                            hot,
                             opacity
                                 * if state == SegmentState::Edge {
-                                    0.58
+                                    0.92
                                 } else {
-                                    0.36
+                                    0.68
                                 },
                         ),
                     ),
@@ -847,19 +872,24 @@ fn push_luminous_segment(
             }
         }
         SegmentGeometry::Polygon(points) => {
-            if glow_alpha > 0.0 {
+            if outer_alpha > 0.0 {
                 shapes.push(Shape::convex_polygon(
                     points.clone(),
-                    with_opacity(color, opacity * glow_alpha * 0.55),
-                    Stroke::new(glow_width, with_opacity(color, opacity * glow_alpha)),
+                    with_opacity(color, opacity * outer_alpha * 0.45),
+                    Stroke::new(spread, with_opacity(color, opacity * outer_alpha)),
+                ));
+                shapes.push(Shape::convex_polygon(
+                    points.clone(),
+                    with_opacity(color, opacity * inner_alpha * 0.55),
+                    Stroke::new(spread * 0.42, with_opacity(color, opacity * inner_alpha)),
                 ));
             }
             shapes.push(Shape::convex_polygon(
                 points,
                 with_opacity(color, opacity * body_alpha),
                 Stroke::new(
-                    if active { 0.65_f32 } else { 0.0_f32 },
-                    with_opacity(Color32::WHITE, opacity * if active { 0.30 } else { 0.0 }),
+                    if active { 0.75_f32 } else { 0.0_f32 },
+                    with_opacity(hot, opacity * if active { 0.72 } else { 0.0 }),
                 ),
             ));
         }
@@ -900,10 +930,18 @@ fn with_opacity(color: Color32, opacity: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, (a as f32 * opacity.clamp(0.0, 1.0)) as u8)
 }
 
+fn hot_face(color: Color32, white_mix: f32) -> Color32 {
+    let [r, g, b, a] = color.to_array();
+    let mix = white_mix.clamp(0.0, 1.0);
+    let heat = |channel: u8| channel as f32 + (255.0 - channel as f32) * mix;
+    Color32::from_rgba_unmultiplied(heat(r) as u8, heat(g) as u8, heat(b) as u8, a)
+}
+
 fn draw_head(painter: &Painter, center: Pos2, color: Color32, opacity: f32) {
-    painter.circle_filled(center, 5.5, with_opacity(color, opacity * 0.09));
-    painter.circle_filled(center, 3.2, with_opacity(color, opacity * 0.26));
-    painter.circle_filled(center, 1.75, with_opacity(Color32::WHITE, opacity));
+    painter.circle_filled(center, 15.0, with_opacity(color, opacity * 0.045));
+    painter.circle_filled(center, 8.0, with_opacity(color, opacity * 0.15));
+    painter.circle_filled(center, 4.2, with_opacity(color, opacity * 0.88));
+    painter.circle_filled(center, 1.8, with_opacity(hot_face(color, 0.84), opacity));
 }
 
 #[derive(Clone, Copy)]
@@ -931,27 +969,53 @@ fn luminous_text(
         anchor,
         &text,
         font.clone(),
-        with_opacity(Color32::from_black_alpha(150), opacity * 0.62),
+        with_opacity(Color32::from_black_alpha(150), opacity * 0.42),
     );
 
-    let (spread, glow_alpha) = match class {
-        TextClass::Channel => ((font.size * 0.11).clamp(1.25, 2.2), 0.16),
-        TextClass::Major => ((font.size * 0.04).clamp(1.8, 3.2), 0.075),
-        TextClass::Secondary => (0.0, 0.0),
+    let (outer_spread, outer_alpha, inner_spread, inner_alpha, face_mix) = match class {
+        TextClass::Channel => (
+            (font.size * 0.20).clamp(2.4, 4.0),
+            0.065,
+            (font.size * 0.09).clamp(1.0, 2.0),
+            0.19,
+            0.64,
+        ),
+        TextClass::Major => (
+            (font.size * 0.055).clamp(2.0, 3.8),
+            0.05,
+            (font.size * 0.024).clamp(0.9, 1.6),
+            0.09,
+            0.18,
+        ),
+        TextClass::Secondary => (0.0, 0.0, 0.0, 0.0, 0.0),
     };
-    if glow_alpha > 0.0 {
+    if outer_alpha > 0.0 {
         for offset in [
-            Vec2::new(-spread, 0.0),
-            Vec2::new(spread, 0.0),
-            Vec2::new(0.0, -spread),
-            Vec2::new(0.0, spread),
+            Vec2::new(-outer_spread, 0.0),
+            Vec2::new(outer_spread, 0.0),
+            Vec2::new(0.0, -outer_spread),
+            Vec2::new(0.0, outer_spread),
         ] {
             painter.text(
                 position + offset,
                 anchor,
                 &text,
                 font.clone(),
-                with_opacity(glow_color, opacity * glow_alpha),
+                with_opacity(glow_color, opacity * outer_alpha),
+            );
+        }
+        for offset in [
+            Vec2::new(-inner_spread, 0.0),
+            Vec2::new(inner_spread, 0.0),
+            Vec2::new(0.0, -inner_spread),
+            Vec2::new(0.0, inner_spread),
+        ] {
+            painter.text(
+                position + offset,
+                anchor,
+                &text,
+                font.clone(),
+                with_opacity(glow_color, opacity * inner_alpha),
             );
         }
     }
@@ -960,6 +1024,6 @@ fn luminous_text(
         anchor,
         text,
         font,
-        with_opacity(core_color, opacity),
+        with_opacity(hot_face(core_color, face_mix), opacity),
     );
 }
