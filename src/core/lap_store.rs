@@ -34,11 +34,21 @@ impl LapStore {
         Self::default()
     }
 
+    pub fn sample_count(&self) -> usize {
+        self.current_lap.len()
+    }
+
     /// Push the latest telemetry point.
     ///
     /// When `track_position` crosses the start/finish line (wraps from near
     /// 1.0 back to near 0.0), the completed lap is saved as the reference.
     pub fn push(&mut self, pt: &TelemetryPoint) {
+        if pt.source.discontinuity {
+            self.clear();
+        }
+        if !pt.telemetry.capabilities.track_position {
+            return;
+        }
         // `buffer.latest()` returns the same point every frame until a new one
         // arrives, so we skip duplicates by comparing captured_at instants.
         if self.last_captured_at == Some(pt.captured_at) {

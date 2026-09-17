@@ -66,8 +66,9 @@ impl<'a> TraceGraph<'a> {
                 .collect();
 
             if !points.is_empty() {
+                let capabilities = points.last().unwrap().telemetry.capabilities;
                 // Draw order: speed → clutch → throttle → brake/ABS (top, always visible)
-                if self.settings.show_speed {
+                if self.settings.show_speed && capabilities.speed {
                     let max_speed = points
                         .iter()
                         .map(|p| p.telemetry.speed)
@@ -103,7 +104,7 @@ impl<'a> TraceGraph<'a> {
                         );
                     }
                 }
-                if self.settings.show_clutch {
+                if self.settings.show_clutch && capabilities.clutch {
                     self.draw_trace(
                         &painter,
                         rect,
@@ -114,10 +115,10 @@ impl<'a> TraceGraph<'a> {
                         self.colors.clutch,
                     );
                 }
-                if self.settings.show_throttle {
+                if self.settings.show_throttle && capabilities.throttle {
                     self.draw_throttle_trace(&painter, rect, &points, now, window_dur);
                 }
-                if self.settings.show_brake {
+                if self.settings.show_brake && capabilities.brake {
                     self.draw_brake_trace(&painter, rect, &points, now, window_dur);
                 }
             }
@@ -197,7 +198,10 @@ impl<'a> TraceGraph<'a> {
                 self.y_position(rect, point.telemetry.throttle),
             );
 
-            let state = if point.telemetry.tc_active && self.settings.show_tc {
+            let state = if point.telemetry.capabilities.tc_activity
+                && point.telemetry.tc_active
+                && self.settings.show_tc
+            {
                 ThrottleState::TcActive
             } else {
                 ThrottleState::Normal
@@ -266,7 +270,10 @@ impl<'a> TraceGraph<'a> {
             let state = if !is_braking {
                 BrakeState::Normal
             } else {
-                match (point.abs_active, is_turning) {
+                match (
+                    point.telemetry.capabilities.abs_activity && point.abs_active,
+                    is_turning,
+                ) {
                     (false, false) => BrakeState::Normal,
                     (false, true) => {
                         if self.settings.show_trail_brake {

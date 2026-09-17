@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::core::{TelemetryData, VehicleTelemetry};
+use crate::core::{TelemetryCapabilities, TelemetryData, VehicleTelemetry};
 use crate::plugins::{GameConfig, GamePlugin};
 
 /// Simulated telemetry plugin (always available, no game required)
@@ -122,12 +122,31 @@ impl MockPlugin {
             brake: brake.clamp(0.0, 1.0),
             clutch: clutch.clamp(0.0, 1.0),
             steering_angle,
+            steering_input: (steering_angle / 900.0).clamp(-1.0, 1.0),
+            wheel_angle_degrees: Some(steering_angle),
             speed: speed / 3.6,
             gear,
             rpm,
             abs_active,
             tc_active: false,
             track_position: (t * 0.01).fract(),
+            handbrake: 0.0,
+            wheel_slip: None,
+            assists: Default::default(),
+            capabilities: TelemetryCapabilities {
+                throttle: true,
+                brake: true,
+                clutch: true,
+                steering_input: true,
+                wheel_angle_degrees: true,
+                speed: true,
+                gear: true,
+                rpm: true,
+                abs_activity: true,
+                tc_activity: true,
+                track_position: true,
+                ..Default::default()
+            },
         }
     }
 }
@@ -171,6 +190,7 @@ impl GamePlugin for MockPlugin {
             timestamp: (self.simulation_time * 1000.0) as u64,
             vehicle: telemetry,
             session: None,
+            source: Default::default(),
         }))
     }
 

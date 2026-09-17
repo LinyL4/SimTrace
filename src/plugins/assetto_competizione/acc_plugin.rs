@@ -5,7 +5,7 @@ use std::f32::consts::PI;
 use anyhow::Result;
 use tracing::{info, warn};
 
-use crate::core::{TelemetryData, VehicleTelemetry};
+use crate::core::{TelemetryCapabilities, TelemetryData, VehicleTelemetry};
 use crate::plugins::{GameConfig, GamePlugin};
 
 use super::mapping::{decode_wstring, status};
@@ -85,12 +85,31 @@ impl GamePlugin for AccPlugin {
             brake: physics.brake.clamp(0.0, 1.0),
             clutch: physics.clutch.clamp(0.0, 1.0),
             steering_angle,
+            steering_input: (steering_angle / 450.0).clamp(-1.0, 1.0),
+            wheel_angle_degrees: Some(steering_angle),
             speed: physics.speed_kmh / 3.6, // km/h → m/s
             gear,
             rpm: physics.rpms as f32,
             abs_active: physics.abs > 0.01,
             tc_active: physics.tc > 0.01,
             track_position: graphics.normalized_car_position,
+            handbrake: 0.0,
+            wheel_slip: None,
+            assists: Default::default(),
+            capabilities: TelemetryCapabilities {
+                throttle: true,
+                brake: true,
+                clutch: true,
+                steering_input: true,
+                wheel_angle_degrees: true,
+                speed: true,
+                gear: true,
+                rpm: true,
+                abs_activity: true,
+                tc_activity: true,
+                track_position: true,
+                ..Default::default()
+            },
         };
 
         let timestamp = std::time::SystemTime::now()
@@ -102,6 +121,7 @@ impl GamePlugin for AccPlugin {
             timestamp,
             vehicle,
             session: None,
+            source: Default::default(),
         }))
     }
 

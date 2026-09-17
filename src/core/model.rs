@@ -4,6 +4,48 @@
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
+/// Declares which normalized channels contain real provider data.
+///
+/// Numeric fields remain available for existing renderers, while this mask makes
+/// an unsupported channel distinct from a legitimate zero/false value.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TelemetryCapabilities {
+    pub throttle: bool,
+    pub brake: bool,
+    pub clutch: bool,
+    pub steering_input: bool,
+    pub wheel_angle_degrees: bool,
+    pub speed: bool,
+    pub gear: bool,
+    pub rpm: bool,
+    pub abs_activity: bool,
+    pub tc_activity: bool,
+    pub handbrake: bool,
+    pub track_position: bool,
+    pub wheel_slip: bool,
+}
+
+/// Status reported by the game, distinct from momentary ABS/TC intervention.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DriverAssistStatus {
+    pub abs_enabled: Option<bool>,
+    /// F1 convention: 0 = off, 1 = medium, 2 = full.
+    pub traction_control_level: Option<u8>,
+}
+
+/// Optional packet-origin metadata. `captured_at` on [`TelemetryPoint`] remains
+/// the authoritative local monotonic receipt time.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+pub struct SourceMetadata {
+    #[serde(default)]
+    pub protocol_format: Option<u16>,
+    pub session_uid: Option<u64>,
+    pub frame_identifier: Option<u32>,
+    pub overall_frame_identifier: Option<u32>,
+    pub packet_time_seconds: Option<f32>,
+    pub discontinuity: bool,
+}
+
 /// Main telemetry data structure returned by game plugins
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryData {
@@ -13,6 +55,8 @@ pub struct TelemetryData {
     pub vehicle: VehicleTelemetry,
     /// Session information (optional, for future features)
     pub session: Option<SessionInfo>,
+    #[serde(default)]
+    pub source: SourceMetadata,
 }
 
 /// Normalized vehicle telemetry
@@ -24,8 +68,13 @@ pub struct VehicleTelemetry {
     pub brake: f32,
     /// Clutch position: 0.0 (no clutch) to 1.0 (full clutch)
     pub clutch: f32,
-    /// Steering angle in degrees (negative = left, positive = right)
+    /// Legacy renderer steering angle. Check `wheel_angle_degrees` and its
+    /// capability before treating this as a physical wheel angle.
     pub steering_angle: f32,
+    /// Normalized steering input: -1.0 (left) to 1.0 (right).
+    pub steering_input: f32,
+    /// Physical wheel angle when a provider exposes it directly.
+    pub wheel_angle_degrees: Option<f32>,
     /// Vehicle speed in m/s
     pub speed: f32,
     /// Current gear (1-7, 0 = neutral, -1 = reverse)
@@ -38,6 +87,12 @@ pub struct VehicleTelemetry {
     pub tc_active: bool,
     /// Track position: 0.0 to 1.0 along the track
     pub track_position: f32,
+    /// Handbrake input: 0.0 to 1.0.
+    pub handbrake: f32,
+    /// Provider-defined normalized wheel slip, RL/RR/FL/FR when available.
+    pub wheel_slip: Option<[f32; 4]>,
+    pub assists: DriverAssistStatus,
+    pub capabilities: TelemetryCapabilities,
 }
 
 /// Session information (optional)
@@ -66,14 +121,17 @@ pub struct TelemetryPoint {
     pub telemetry: VehicleTelemetry,
     /// ABS state at capture time (persisted for coloring)
     pub abs_active: bool,
+    pub source: SourceMetadata,
 }
 
 impl TelemetryPoint {
-    pub fn new(telemetry: VehicleTelemetry, abs_active: bool) -> Self {
+    pub fn new(data: TelemetryData) -> Self {
+        let abs_active = data.vehicle.abs_active;
         Self {
             captured_at: Instant::now(),
-            telemetry,
+            telemetry: data.vehicle,
             abs_active,
+            source: data.source,
         }
     }
 }
@@ -92,6 +150,13 @@ impl VehicleTelemetry {
     /// Get the maximum pedal input (throttle or brake)
     pub fn max_pedal(&self) -> f32 {
         self.throttle.max(self.brake)
+    }
+
+    /// Steering angle for existing visualizations. Providers with a physical
+    /// angle use it; normalized-only providers use the configured half-lock.
+    pub fn effective_steering_degrees(&self, half_lock_degrees: f32) -> f32 {
+        self.wheel_angle_degrees
+            .unwrap_or(self.steering_input.clamp(-1.0, 1.0) * half_lock_degrees)
     }
 }
 
@@ -120,5 +185,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(telemetry.max_pedal(), 0.7);
+    }
+
+    #[test]
+    fn unsupported_is_distinct_from_zero() {
+        let unsupported = VehicleTelemetry::default();
+        let supported_zero = VehicleTelemetry {
+            capabilities: TelemetryCapabilities {
+                throttle: true,
+                abs_activity: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(unsupported.throttle, supported_zero.throttle);
+        assert!(!unsupported.capabilities.throttle);
+        assert!(supported_zero.capabilities.throttle);
+        assert!(!unsupported.capabilities.abs_activity);
+        assert!(supported_zero.capabilities.abs_activity);
     }
 }

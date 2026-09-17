@@ -1,43 +1,60 @@
 //! Telemetry buffer - stores telemetry points with a sliding time window
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use crate::core::{TelemetryPoint, VehicleTelemetry};
+use crate::core::{TelemetryData, TelemetryPoint};
+
+const EXPECTED_MAX_SAMPLE_RATE_HZ: usize = 240;
+const MIN_POINTS: usize = 10;
 
 /// Buffer storing telemetry points with a configurable time window
 pub struct TelemetryBuffer {
     /// Maximum time window to keep
     window_duration: Duration,
     /// Stored telemetry points
-    data: RwLock<Vec<TelemetryPoint>>,
+    data: RwLock<VecDeque<TelemetryPoint>>,
     /// Minimum points to keep (prevents empty buffer)
     min_points: usize,
+    max_points: usize,
 }
 
 impl TelemetryBuffer {
     /// Create a new buffer with the specified time window
     pub fn new(window_duration: Duration) -> Self {
+        let max_points = ((window_duration.as_secs_f64() * EXPECTED_MAX_SAMPLE_RATE_HZ as f64)
+            .ceil() as usize)
+            .max(MIN_POINTS);
+        Self::with_capacity(window_duration, max_points)
+    }
+
+    fn with_capacity(window_duration: Duration, max_points: usize) -> Self {
         Self {
             window_duration,
-            data: RwLock::new(Vec::with_capacity(1000)),
-            min_points: 10,
+            data: RwLock::new(VecDeque::with_capacity(max_points)),
+            min_points: MIN_POINTS.min(max_points),
+            max_points,
         }
     }
 
     /// Push a new telemetry point
-    pub fn push(&self, telemetry: VehicleTelemetry, abs_active: bool) {
-        let point = TelemetryPoint::new(telemetry, abs_active);
+    pub fn push(&self, telemetry: TelemetryData) -> TelemetryPoint {
+        let point = TelemetryPoint::new(telemetry);
         let mut data = self.data.write().unwrap();
-        data.push(point);
+        data.push_back(point.clone());
         self.prune_old_points(&mut data);
+        while data.len() > self.max_points {
+            data.pop_front();
+        }
+        point
     }
 
     /// Get all points within the current time window
     pub fn get_points(&self) -> Vec<TelemetryPoint> {
         let data = self.data.read().unwrap();
-        data.clone()
+        data.iter().cloned().collect()
     }
 
     /// Get points for a specific time range
@@ -55,7 +72,7 @@ impl TelemetryBuffer {
     /// Get the latest point
     pub fn latest(&self) -> Option<TelemetryPoint> {
         let data = self.data.read().unwrap();
-        data.last().cloned()
+        data.back().cloned()
     }
 
     /// Clear all data
@@ -79,21 +96,14 @@ impl TelemetryBuffer {
     }
 
     /// Remove old points outside the time window
-    fn prune_old_points(&self, data: &mut Vec<TelemetryPoint>) {
+    fn prune_old_points(&self, data: &mut VecDeque<TelemetryPoint>) {
         let now = std::time::Instant::now();
         let cutoff = now - self.window_duration;
 
-        // Find the first point within the window
-        let keep_from = data
-            .iter()
-            .position(|p| p.captured_at >= cutoff)
-            .unwrap_or(data.len());
-
-        // Keep at least min_points even if they're outside the window
-        let keep_from = keep_from.min(data.len().saturating_sub(self.min_points));
-
-        if keep_from > 0 {
-            data.drain(..keep_from);
+        while data.len() > self.min_points
+            && data.front().is_some_and(|point| point.captured_at < cutoff)
+        {
+            data.pop_front();
         }
     }
 }
@@ -109,16 +119,22 @@ mod tests {
     use super::*;
     use std::thread;
 
+    fn data(throttle: f32) -> TelemetryData {
+        TelemetryData {
+            timestamp: 0,
+            vehicle: crate::core::VehicleTelemetry {
+                throttle,
+                ..Default::default()
+            },
+            session: None,
+            source: Default::default(),
+        }
+    }
+
     #[test]
     fn test_push_and_get() {
         let buffer = TelemetryBuffer::new(Duration::from_secs(10));
-        buffer.push(
-            VehicleTelemetry {
-                throttle: 0.5,
-                ..Default::default()
-            },
-            false,
-        );
+        buffer.push(data(0.5));
         assert_eq!(buffer.len(), 1);
         assert_eq!(buffer.get_points()[0].telemetry.throttle, 0.5);
     }
@@ -127,7 +143,7 @@ mod tests {
     fn test_latest() {
         let buffer = TelemetryBuffer::new(Duration::from_secs(10));
         assert!(buffer.latest().is_none());
-        buffer.push(VehicleTelemetry::default(), false);
+        buffer.push(data(0.0));
         assert!(buffer.latest().is_some());
     }
 
@@ -135,7 +151,7 @@ mod tests {
     fn test_clear_empties_buffer() {
         let buffer = TelemetryBuffer::new(Duration::from_secs(10));
         for _ in 0..5 {
-            buffer.push(VehicleTelemetry::default(), false);
+            buffer.push(data(0.0));
         }
         assert_eq!(buffer.len(), 5);
         buffer.clear();
@@ -158,15 +174,15 @@ mod tests {
         let min_points = 10;
 
         for _ in 0..(min_points + 5) {
-            buffer.push(VehicleTelemetry::default(), false);
+            buffer.push(data(0.0));
         }
-        assert_eq!(buffer.len(), min_points + 5);
+        assert!((min_points..=min_points + 5).contains(&buffer.len()));
 
         // Wait for all existing points to fall outside the window.
         thread::sleep(Duration::from_millis(100));
 
         // A new push triggers pruning; the min_points floor should keep old entries.
-        buffer.push(VehicleTelemetry::default(), false);
+        buffer.push(data(0.0));
         assert!(
             buffer.len() >= min_points,
             "expected at least {} points, got {}",
@@ -182,12 +198,22 @@ mod tests {
 
         // Overfill the buffer, then wait for points to age out.
         for _ in 0..(min_points * 3) {
-            buffer.push(VehicleTelemetry::default(), false);
+            buffer.push(data(0.0));
         }
         thread::sleep(Duration::from_millis(100));
 
         // After a push, expired entries should be pruned down to min_points.
-        buffer.push(VehicleTelemetry::default(), false);
+        buffer.push(data(0.0));
         assert!(buffer.len() <= min_points + 1); // +1 for the point just pushed
+    }
+
+    #[test]
+    fn capacity_is_strictly_bounded() {
+        let buffer = TelemetryBuffer::with_capacity(Duration::from_secs(60), 16);
+        for i in 0..100 {
+            buffer.push(data(i as f32));
+        }
+        assert_eq!(buffer.len(), 16);
+        assert_eq!(buffer.get_points()[0].telemetry.throttle, 84.0);
     }
 }

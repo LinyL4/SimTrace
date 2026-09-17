@@ -1,10 +1,11 @@
 //! Main application
 
 use crate::config::{AppSettings, ParsedColors};
-use crate::core::{DataCollector, TelemetryBuffer};
+use crate::core::{DataCollector, LapStore, TelemetryBuffer};
+use crate::plugins::ProviderConfig;
 use eframe::egui;
 use egui::color_picker::{color_edit_button_srgba, Alpha};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // The buffer is kept larger than the maximum display window so the slider can
 // show the full range without data disappearing at the top.
@@ -22,7 +23,7 @@ const STRIP_GAP: f32 = 3.0;
 // ── Background poller ─────────────────────────────────────────────────────────
 
 enum PollerCmd {
-    ActivatePlugin(String),
+    ActivatePlugin(String, ProviderConfig),
 }
 
 /// Owns the background polling thread. Dropping this stops the thread.
@@ -59,8 +60,10 @@ pub struct SimTraceApp {
     save_toast: Option<std::time::Instant>,
     /// Colors pre-parsed from `settings.colors`; re-derived when config changes them.
     parsed_colors: ParsedColors,
-    /// Lap boundary detection and per-lap telemetry for comparison.
-    lap_store: crate::core::LapStore,
+    /// Analysis state is fed by the collector thread for every accepted sample.
+    analysis: Arc<Mutex<LapStore>>,
+    active_provider_config: ProviderConfig,
+    last_update_at: std::time::Instant,
 }
 
 impl SimTraceApp {
@@ -74,7 +77,8 @@ impl SimTraceApp {
         let settings = crate::config::AppSettings::load_or_default();
         let active_plugin = settings.collector.plugin.clone();
         let parsed_colors = ParsedColors::from_scheme(&settings.colors);
-        let max_steering_angle = crate::plugins::create_plugin(&active_plugin)
+        let provider_config = provider_config(&settings);
+        let max_steering_angle = crate::plugins::create_plugin(&active_plugin, &provider_config)
             .map(|p| p.get_config().max_steering_angle)
             .unwrap_or(450.0);
         Self {
@@ -92,7 +96,9 @@ impl SimTraceApp {
             active_plugin,
             save_toast: None,
             parsed_colors,
-            lap_store: crate::core::LapStore::new(),
+            analysis: Arc::new(Mutex::new(LapStore::new())),
+            active_provider_config: provider_config,
+            last_update_at: std::time::Instant::now(),
         }
     }
 
@@ -100,20 +106,23 @@ impl SimTraceApp {
         let mut collector = DataCollector::new(BUFFER_CAPACITY_SECS);
         // Share the collector's buffer with the UI before moving the collector.
         self.buffer = collector.buffer();
+        self.analysis = collector.analysis();
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<PollerCmd>();
         let plugin_name = self.settings.collector.plugin.clone();
+        let plugin_config = provider_config(&self.settings);
         let poll_interval = std::time::Duration::from_micros(1_000_000 / POLL_RATE_HZ);
 
         let thread = std::thread::spawn(move || {
-            let _ = collector.activate_plugin(&plugin_name);
+            let _ = collector.activate_plugin(&plugin_name, &plugin_config);
             loop {
                 collector.poll();
                 loop {
                     match cmd_rx.try_recv() {
-                        Ok(PollerCmd::ActivatePlugin(name)) => {
+                        Ok(PollerCmd::ActivatePlugin(name, config)) => {
                             collector.buffer().clear();
-                            let _ = collector.activate_plugin(&name);
+                            collector.analysis().lock().unwrap().clear();
+                            let _ = collector.activate_plugin(&name, &config);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
@@ -132,16 +141,20 @@ impl SimTraceApp {
 
     fn activate_plugin(&mut self) {
         let plugin = self.settings.collector.plugin.clone();
+        let config = provider_config(&self.settings);
         if let Some(h) = &self.poller {
-            let _ = h.cmd_tx.send(PollerCmd::ActivatePlugin(plugin.clone()));
+            let _ = h
+                .cmd_tx
+                .send(PollerCmd::ActivatePlugin(plugin.clone(), config.clone()));
         }
         self.buffer.clear();
         self.current_steering = 0.0;
-        self.max_steering_angle = crate::plugins::create_plugin(&plugin)
+        self.max_steering_angle = crate::plugins::create_plugin(&plugin, &config)
             .map(|p| p.get_config().max_steering_angle)
             .unwrap_or(450.0);
         self.active_plugin = plugin;
-        self.lap_store.clear();
+        self.active_provider_config = config;
+        self.analysis.lock().unwrap().clear();
     }
 }
 
@@ -155,6 +168,12 @@ impl eframe::App for SimTraceApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = std::time::Instant::now();
+        let frame_dt = now
+            .duration_since(self.last_update_at)
+            .as_secs_f32()
+            .min(0.25);
+        self.last_update_at = now;
         // Force dark visuals every frame — prevents the OS light theme from
         // overriding our settings (observed on Windows 11 with light mode).
         ctx.set_visuals(egui::Visuals {
@@ -183,15 +202,18 @@ impl eframe::App for SimTraceApp {
         if self.running && self.poller.is_none() {
             self.start();
         }
-        if self.settings.collector.plugin != self.active_plugin {
+        if self.settings.collector.plugin != self.active_plugin
+            || provider_config(&self.settings) != self.active_provider_config
+        {
             self.activate_plugin();
         }
 
         // ── Read latest telemetry ────────────────────────────────────────────
         if self.running {
             if let Some(pt) = self.buffer.latest() {
-                self.current_steering = pt.telemetry.steering_angle;
-                self.lap_store.push(&pt);
+                self.current_steering = pt
+                    .telemetry
+                    .effective_steering_degrees(self.max_steering_angle);
             }
         }
         // Clone the Arc so the closure below can take &mut self freely.
@@ -201,11 +223,8 @@ impl eframe::App for SimTraceApp {
             None
         };
         // Clone the reference lap so the closure can read it without borrowing self.
-        let reference_lap = self.lap_store.reference_lap.clone();
-
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-            MIN_WIDTH, MIN_HEIGHT,
-        )));
+        let analysis_snapshot = self.analysis.lock().unwrap().clone();
+        let reference_lap = analysis_snapshot.reference_lap.clone();
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -229,11 +248,9 @@ impl eframe::App for SimTraceApp {
                     0.0_f32
                 };
                 // Fast in, slow out
-                let speed = if target > self.bar_alpha { 0.18 } else { 0.06 };
-                self.bar_alpha += (target - self.bar_alpha) * speed;
-                if (self.bar_alpha - target).abs() > 0.005 {
-                    ctx.request_repaint(); // keep animating
-                }
+                let rate = if target > self.bar_alpha { 16.0 } else { 5.0 };
+                let blend = 1.0 - (-rate * frame_dt).exp();
+                self.bar_alpha += (target - self.bar_alpha) * blend;
                 let ba = (a as f32 * self.bar_alpha) as u8;
 
                 // ── Title bar — same width as content card ───────────────────
@@ -524,7 +541,7 @@ impl eframe::App for SimTraceApp {
                             &mut self.running,
                             &mut self.save_toast,
                             buffer.as_ref(),
-                            &mut self.lap_store,
+                            &self.analysis,
                         );
                     });
                     // Re-derive parsed colors in case the color pickers changed them.
@@ -597,10 +614,9 @@ impl eframe::App for SimTraceApp {
 
         // ── Lap comparison viewport ───────────────────────────────────────────
         if self.settings.graph.lap_comparison_open {
-            let reference = self.lap_store.reference_lap.clone();
-            let current = self.lap_store.current_lap().to_vec();
-            let current_track_pos = self
-                .lap_store
+            let reference = analysis_snapshot.reference_lap.clone();
+            let current = analysis_snapshot.current_lap().to_vec();
+            let current_track_pos = analysis_snapshot
                 .current_lap()
                 .last()
                 .map(|p| p.track_position)
@@ -655,6 +671,7 @@ impl eframe::App for SimTraceApp {
                 let _ = self.settings.save_to_config_path();
             }
         }
+        ctx.request_repaint_after(render_interval(&self.settings));
     }
 }
 
@@ -676,14 +693,20 @@ fn draw_telemetry(
     let available = ui.available_rect_before_wrap();
 
     let latest = buffer.and_then(|b| b.latest());
+    let capabilities = latest
+        .as_ref()
+        .map(|point| point.telemetry.capabilities)
+        .unwrap_or_default();
     let throttle = latest.as_ref().map(|p| p.telemetry.throttle).unwrap_or(0.0);
     let brake = latest.as_ref().map(|p| p.telemetry.brake).unwrap_or(0.0);
     let clutch = latest.as_ref().map(|p| p.telemetry.clutch).unwrap_or(0.0);
-    let abs_on = latest.as_ref().map(|p| p.abs_active).unwrap_or(false);
+    let abs_on =
+        capabilities.abs_activity && latest.as_ref().map(|p| p.abs_active).unwrap_or(false);
     let tc_on = latest
         .as_ref()
         .map(|p| p.telemetry.tc_active)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && capabilities.tc_activity;
     let gear = latest.as_ref().map(|p| p.telemetry.gear).unwrap_or(0);
     let speed_ms = latest.as_ref().map(|p| p.telemetry.speed).unwrap_or(0.0);
 
@@ -743,15 +766,15 @@ fn draw_telemetry(
             colors.throttle
         };
 
-        let specs: &[(f32, egui::Color32)] = &[
-            (clutch, colors.clutch),
-            (brake, brake_color),
-            (throttle, throttle_color),
+        let specs: &[(f32, egui::Color32, bool)] = &[
+            (clutch, colors.clutch, capabilities.clutch),
+            (brake, brake_color, capabilities.brake),
+            (throttle, throttle_color, capabilities.throttle),
         ];
 
         let label_h = 16.0_f32;
         let bar_labels = ["C", "B", "T"];
-        for (i, (value, color)) in specs.iter().enumerate() {
+        for (i, (value, color, supported)) in specs.iter().enumerate() {
             let x = bars_rect.min.x + i as f32 * (bar_w + bar_gap);
             let top = bars_rect.min.y + label_h + 2.0;
             let bottom = bars_rect.max.y - 4.0;
@@ -761,7 +784,11 @@ fn draw_telemetry(
             p.text(
                 egui::pos2(x + bar_w / 2.0, bars_rect.min.y + label_h / 2.0),
                 egui::Align2::CENTER_CENTER,
-                format!("{:.0}%", value * 100.0),
+                if *supported {
+                    format!("{:.0}%", value * 100.0)
+                } else {
+                    "—".to_owned()
+                },
                 egui::FontId::monospace(10.0),
                 with_alpha(LABEL_MID, a),
             );
@@ -789,7 +816,7 @@ fn draw_telemetry(
             );
 
             // Fill
-            if *value > 0.005 {
+            if *supported && *value > 0.005 {
                 let fill_h = (h * value).max(2.0);
                 p.rect_filled(
                     egui::Rect::from_min_size(
@@ -832,10 +859,11 @@ fn draw_telemetry(
         );
 
         // Gear — large, centred inside the ring
-        let gear_str = match gear {
-            -1 => "R".to_string(),
-            0 => "N".to_string(),
-            g => g.to_string(),
+        let gear_str = match (capabilities.gear, gear) {
+            (false, _) => "—".to_string(),
+            (true, -1) => "R".to_string(),
+            (true, 0) => "N".to_string(),
+            (true, g) => g.to_string(),
         };
         ui.painter().text(
             egui::pos2(center.x, center.y - wheel_radius * 0.32),
@@ -878,14 +906,18 @@ fn draw_telemetry(
         ui.painter().text(
             speed_pos,
             egui::Align2::CENTER_CENTER,
-            format!("{:.0}", speed_val),
+            if capabilities.speed {
+                format!("{:.0}", speed_val)
+            } else {
+                "—".to_owned()
+            },
             egui::FontId::monospace(speed_font_size),
             with_alpha(LABEL_MID, a),
         );
     });
 
     // ── Track position strip ─────────────────────────────────────────────────
-    if settings.graph.show_track_strip {
+    if settings.graph.show_track_strip && capabilities.track_position {
         let current_track_pos = latest
             .as_ref()
             .map(|p| p.telemetry.track_position)
@@ -1070,7 +1102,7 @@ fn draw_config(
     running: &mut bool,
     save_toast: &mut Option<std::time::Instant>,
     buffer: Option<&Arc<crate::core::TelemetryBuffer>>,
-    lap_store: &mut crate::core::LapStore,
+    analysis: &Arc<Mutex<crate::core::LapStore>>,
 ) {
     // Ensure all widgets (sliders, dropdowns, colour pickers) use dark styling
     // regardless of the OS theme reported by the platform layer.
@@ -1130,7 +1162,6 @@ fn draw_config(
                     .monospace()
                     .color(egui::Color32::from_rgba_unmultiplied(100, 220, 100, ta)),
             );
-            ui.ctx().request_repaint();
         } else {
             *save_toast = None;
         }
@@ -1146,11 +1177,54 @@ fn draw_config(
                 ui.selectable_value(&mut settings.collector.plugin, id.to_string(), *name);
             }
         });
+    if settings.collector.plugin == "f1" || settings.collector.plugin == "f1_25" {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Listen address")
+                    .size(11.0)
+                    .color(LABEL_MID),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut settings.collector.f1_bind_address)
+                        .desired_width(110.0),
+                );
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("UDP port").size(11.0).color(LABEL_MID));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::DragValue::new(&mut settings.collector.f1_udp_port).range(1..=65535));
+            });
+        });
+        ui.label(
+            egui::RichText::new("Auto-detects native 2025/2026, direct or forwarded")
+                .size(9.0)
+                .color(LABEL_DIM),
+        );
+    }
 
     // ── Display ──────────────────────────────────────────────────────────────
     section_header(ui, "DISPLAY");
     ui.checkbox(&mut settings.graph.show_legend, "Show legend");
     ui.checkbox(&mut settings.graph.show_track_strip, "Show track strip");
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("UI refresh")
+                .size(11.0)
+                .color(LABEL_MID),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            egui::ComboBox::from_id_salt("ui_fps")
+                .selected_text(format!("{} FPS", settings.graph.validated_ui_fps()))
+                .show_ui(ui, |ui| {
+                    for fps in crate::config::GraphSettings::VALID_UI_FPS {
+                        ui.selectable_value(&mut settings.graph.ui_fps, fps, format!("{fps} FPS"));
+                    }
+                });
+        });
+    });
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Speed unit")
@@ -1288,17 +1362,17 @@ fn draw_config(
         settings.graph.lap_comparison_open = !settings.graph.lap_comparison_open;
     }
     ui.add_space(4.0);
-    let ref_status = match &lap_store.reference_lap {
+    let ref_status = match &analysis.lock().unwrap().reference_lap {
         Some(pts) => format!("Ref: {} pts", pts.len()),
         None => "No reference lap".to_string(),
     };
     ui.label(egui::RichText::new(ref_status).size(10.0).color(LABEL_DIM));
     ui.horizontal(|ui| {
         if ui.add(styled_button("Set Ref")).clicked() {
-            lap_store.set_current_as_reference();
+            analysis.lock().unwrap().set_current_as_reference();
         }
         if ui.add(styled_button("Clear")).clicked() {
-            lap_store.clear_reference();
+            analysis.lock().unwrap().clear_reference();
         }
     });
 
@@ -1307,6 +1381,32 @@ fn draw_config(
     if ui.add(styled_button("Open log folder")).clicked() {
         if let Some(dir) = AppSettings::config_dir() {
             open_in_file_manager(&dir);
+        }
+    }
+}
+
+fn provider_config(settings: &AppSettings) -> ProviderConfig {
+    ProviderConfig {
+        f1_bind_address: settings.collector.f1_bind_address.trim().to_owned(),
+        f1_udp_port: settings.collector.f1_udp_port,
+    }
+}
+
+fn render_interval(settings: &AppSettings) -> std::time::Duration {
+    std::time::Duration::from_secs_f64(1.0 / settings.graph.validated_ui_fps() as f64)
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn configured_refresh_rates_produce_timed_intervals() {
+        let mut settings = AppSettings::default();
+        for fps in crate::config::GraphSettings::VALID_UI_FPS {
+            settings.graph.ui_fps = fps;
+            let expected = 1.0 / fps as f64;
+            assert!((render_interval(&settings).as_secs_f64() - expected).abs() < 1e-9);
         }
     }
 }

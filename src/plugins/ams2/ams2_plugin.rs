@@ -8,7 +8,7 @@ use crate::plugins::{GameConfig, GamePlugin};
 #[cfg(windows)]
 use super::shared_memory::Ams2SharedMemory;
 #[cfg(windows)]
-use crate::core::VehicleTelemetry;
+use crate::core::{TelemetryCapabilities, VehicleTelemetry};
 #[cfg(windows)]
 use tracing::{info, warn};
 
@@ -127,12 +127,28 @@ impl GamePlugin for Ams2Plugin {
                 brake,
                 clutch,
                 steering_angle,
+                steering_input: (steering_angle / 450.0).clamp(-1.0, 1.0),
+                wheel_angle_degrees: Some(steering_angle),
                 speed,
                 gear,
                 rpm: 0.0, // not read to keep offsets simple
                 abs_active,
                 tc_active: false,
                 track_position: 0.0,
+                handbrake: 0.0,
+                wheel_slip: None,
+                assists: Default::default(),
+                capabilities: TelemetryCapabilities {
+                    throttle: true,
+                    brake: true,
+                    clutch: true,
+                    steering_input: true,
+                    wheel_angle_degrees: true,
+                    speed: true,
+                    gear: true,
+                    abs_activity: true,
+                    ..Default::default()
+                },
             };
 
             let timestamp = std::time::SystemTime::now()
@@ -144,6 +160,7 @@ impl GamePlugin for Ams2Plugin {
                 timestamp,
                 vehicle,
                 session: None,
+                source: Default::default(),
             }))
         }
         #[cfg(not(windows))]

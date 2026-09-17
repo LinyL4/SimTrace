@@ -16,6 +16,18 @@ pub struct AppSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorConfig {
     pub plugin: String,
+    #[serde(default = "default_f1_bind_address")]
+    pub f1_bind_address: String,
+    #[serde(default = "default_f1_udp_port")]
+    pub f1_udp_port: u16,
+}
+
+fn default_f1_bind_address() -> String {
+    "0.0.0.0".to_owned()
+}
+
+fn default_f1_udp_port() -> u16 {
+    20777
 }
 
 /// Graph visualization settings.
@@ -52,6 +64,24 @@ pub struct GraphSettings {
     pub lap_comparison_open: bool,
     pub show_tc: bool,
     pub show_speed: bool,
+    #[serde(default = "default_ui_fps")]
+    pub ui_fps: u32,
+}
+
+fn default_ui_fps() -> u32 {
+    60
+}
+
+impl GraphSettings {
+    pub const VALID_UI_FPS: [u32; 4] = [30, 60, 90, 120];
+
+    pub fn validated_ui_fps(&self) -> u32 {
+        if Self::VALID_UI_FPS.contains(&self.ui_fps) {
+            self.ui_fps
+        } else {
+            default_ui_fps()
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -157,6 +187,8 @@ impl Default for AppSettings {
         Self {
             collector: CollectorConfig {
                 plugin: "mock".to_string(),
+                f1_bind_address: default_f1_bind_address(),
+                f1_udp_port: default_f1_udp_port(),
             },
             graph: GraphSettings {
                 window_seconds: 10.0,
@@ -176,6 +208,7 @@ impl Default for AppSettings {
                 lap_comparison_open: false,
                 show_tc: true,
                 show_speed: true,
+                ui_fps: default_ui_fps(),
             },
             colors: ColorScheme {
                 throttle: "#00FF00".to_string(),
@@ -270,6 +303,7 @@ mod tests {
         assert_eq!(s.collector.plugin, "mock");
         assert_eq!(s.overlay.opacity, 1.0);
         assert_eq!(s.graph.window_seconds, 10.0);
+        assert_eq!(s.graph.validated_ui_fps(), 60);
     }
 
     #[test]
@@ -332,6 +366,7 @@ mod tests {
         let s: AppSettings = toml::from_str(toml_str).unwrap();
         assert_eq!(s.colors.clutch, default_clutch_color());
         assert!(!s.graph.speed_mph);
+        assert_eq!(s.graph.validated_ui_fps(), 60);
     }
 
     #[test]
@@ -358,5 +393,16 @@ mod tests {
             AppSettings::parse_color("not-a-color"),
             egui::Color32::WHITE
         );
+    }
+
+    #[test]
+    fn render_rate_is_validated() {
+        let mut settings = AppSettings::default();
+        for fps in GraphSettings::VALID_UI_FPS {
+            settings.graph.ui_fps = fps;
+            assert_eq!(settings.graph.validated_ui_fps(), fps);
+        }
+        settings.graph.ui_fps = 75;
+        assert_eq!(settings.graph.validated_ui_fps(), 60);
     }
 }

@@ -22,6 +22,7 @@ fn main() -> eframe::Result<()> {
 
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([saved.overlay.width, saved.overlay.height])
+        .with_min_inner_size([300.0, 130.0])
         .with_position(egui::pos2(
             saved.overlay.position_x,
             saved.overlay.position_y,

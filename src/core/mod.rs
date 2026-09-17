@@ -8,4 +8,7 @@ pub mod model;
 pub use buffer::TelemetryBuffer;
 pub use collector::DataCollector;
 pub use lap_store::LapStore;
-pub use model::{TelemetryData, TelemetryPoint, VehicleTelemetry};
+pub use model::{
+    DriverAssistStatus, SourceMetadata, TelemetryCapabilities, TelemetryData, TelemetryPoint,
+    VehicleTelemetry,
+};

@@ -1,7 +1,7 @@
 //! Plugin registry for managing available game plugins.
 #![allow(dead_code)]
 
-use crate::plugins::GamePlugin;
+use crate::plugins::{GamePlugin, ProviderConfig};
 use anyhow::Result;
 use tracing::info;
 
@@ -30,6 +30,7 @@ impl PluginRegistry {
             "assetto_competizione".to_string(),
             "ams2".to_string(),
             "iracing".to_string(),
+            "f1".to_string(),
         ];
 
         #[cfg(not(windows))]
@@ -43,13 +44,13 @@ impl PluginRegistry {
 
     /// Activate a plugin by name. Registers the plugin even if the initial
     /// connection fails — the collector will retry automatically.
-    pub fn activate(&mut self, name: &str) -> Result<()> {
+    pub fn activate(&mut self, name: &str, config: &ProviderConfig) -> Result<()> {
         if let Some(ref mut plugin) = self.active_plugin {
             plugin.disconnect();
         }
         self.active_plugin = None;
 
-        let mut plugin = crate::plugins::create_plugin(name)
+        let mut plugin = crate::plugins::create_plugin(name, config)
             .ok_or_else(|| anyhow::anyhow!("Plugin '{}' not found", name))?;
 
         if let Err(e) = plugin.connect() {
@@ -109,23 +110,31 @@ mod tests {
     fn test_activate_mock_plugin_connects() {
         let mut registry = PluginRegistry::new();
         assert!(!registry.is_connected());
-        registry.activate("mock").unwrap();
+        registry
+            .activate("mock", &ProviderConfig::default())
+            .unwrap();
         assert!(registry.is_connected());
     }
 
     #[test]
     fn test_activate_unknown_plugin_errors() {
         let mut registry = PluginRegistry::new();
-        assert!(registry.activate("does_not_exist").is_err());
+        assert!(registry
+            .activate("does_not_exist", &ProviderConfig::default())
+            .is_err());
     }
 
     #[test]
     fn test_activate_replaces_previous_plugin() {
         let mut registry = PluginRegistry::new();
-        registry.activate("mock").unwrap();
+        registry
+            .activate("mock", &ProviderConfig::default())
+            .unwrap();
         assert!(registry.is_connected());
         // Activating again replaces the existing plugin.
-        registry.activate("mock").unwrap();
+        registry
+            .activate("mock", &ProviderConfig::default())
+            .unwrap();
         assert!(registry.is_connected());
     }
 }
