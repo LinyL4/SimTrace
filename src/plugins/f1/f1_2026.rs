@@ -71,6 +71,10 @@ impl Decoder {
                         clutch: protocol::read_u8(bytes, base + 14)?,
                         gear: protocol::read_i8(bytes, base + 15)?,
                         rpm: protocol::read_u16(bytes, base + 16)?,
+                        // The 2026 variant retains the official rev-light fields
+                        // at +19/+20 even though later fields and item size differ.
+                        rev_lights_percent: protocol::read_u8(bytes, base + 19)?,
+                        rev_lights_bit_value: protocol::read_u16(bytes, base + 20)?,
                     },
                 )
             }
@@ -95,6 +99,8 @@ pub(super) fn test_telemetry_packet(player: usize, frame: u32) -> Vec<u8> {
     bytes[base + 14] = 40;
     bytes[base + 15] = 7;
     bytes[base + 16..base + 18].copy_from_slice(&12_345_u16.to_le_bytes());
+    bytes[base + 19] = 73;
+    bytes[base + 20..base + 22].copy_from_slice(&0x03ff_u16.to_le_bytes());
     bytes
 }
 
@@ -131,6 +137,8 @@ mod tests {
         assert_eq!(data.vehicle.steering_input, -0.5);
         assert_eq!(data.vehicle.gear, 7);
         assert_eq!(data.vehicle.rpm, 12_345.0);
+        assert_eq!(data.vehicle.rev_lights.unwrap().percent, 73);
+        assert_eq!(data.vehicle.rev_lights.unwrap().bit_value, 0x03ff);
         assert_eq!(data.source.protocol_format, Some(2026));
     }
 

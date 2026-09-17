@@ -127,6 +127,7 @@ impl MockPlugin {
             speed: speed / 3.6,
             gear,
             rpm,
+            rev_lights: None,
             abs_active,
             tc_active: false,
             track_position: (t * 0.01).fract(),

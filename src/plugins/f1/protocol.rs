@@ -4,7 +4,8 @@ use std::fmt;
 use anyhow::Result;
 
 use crate::core::{
-    DriverAssistStatus, SourceMetadata, TelemetryCapabilities, TelemetryData, VehicleTelemetry,
+    DriverAssistStatus, RevLights, SourceMetadata, TelemetryCapabilities, TelemetryData,
+    VehicleTelemetry,
 };
 
 pub const HEADER_LEN: usize = 29;
@@ -117,6 +118,8 @@ pub struct VehicleFields {
     pub clutch: u8,
     pub gear: i8,
     pub rpm: u16,
+    pub rev_lights_percent: u8,
+    pub rev_lights_bit_value: u16,
 }
 
 impl DecoderState {
@@ -194,6 +197,10 @@ impl DecoderState {
                 speed: fields.speed_kph as f32 / 3.6,
                 gear: fields.gear as i32,
                 rpm: fields.rpm as f32,
+                rev_lights: Some(RevLights {
+                    percent: fields.rev_lights_percent,
+                    bit_value: fields.rev_lights_bit_value,
+                }),
                 abs_active: false,
                 tc_active: false,
                 track_position: track_position.unwrap_or(0.0),

@@ -132,6 +132,7 @@ impl GamePlugin for Ams2Plugin {
                 speed,
                 gear,
                 rpm: 0.0, // not read to keep offsets simple
+                rev_lights: None,
                 abs_active,
                 tc_active: false,
                 track_position: 0.0,

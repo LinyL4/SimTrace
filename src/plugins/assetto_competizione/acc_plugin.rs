@@ -90,6 +90,7 @@ impl GamePlugin for AccPlugin {
             speed: physics.speed_kmh / 3.6, // km/h → m/s
             gear,
             rpm: physics.rpms as f32,
+            rev_lights: None,
             abs_active: physics.abs > 0.01,
             tc_active: physics.tc > 0.01,
             track_position: graphics.normalized_car_position,

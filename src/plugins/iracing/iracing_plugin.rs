@@ -134,6 +134,7 @@ impl GamePlugin for IracingPlugin {
                 speed,
                 gear,
                 rpm,
+                rev_lights: None,
                 abs_active,
                 tc_active: false,
                 track_position,

@@ -33,6 +33,17 @@ pub struct DriverAssistStatus {
     pub traction_control_level: Option<u8>,
 }
 
+/// Shift-light state supplied by a telemetry provider.
+///
+/// F1 exposes both the percentage and the exact 15-light bitfield. Keeping the
+/// pair optional distinguishes unsupported providers from a legitimate all-off
+/// state without adding a capability bit for one provider-specific detail.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RevLights {
+    pub percent: u8,
+    pub bit_value: u16,
+}
+
 /// Optional packet-origin metadata. `captured_at` on [`TelemetryPoint`] remains
 /// the authoritative local monotonic receipt time.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
@@ -81,6 +92,8 @@ pub struct VehicleTelemetry {
     pub gear: i32,
     /// Engine RPM
     pub rpm: f32,
+    /// Provider-supplied shift-light state, when available.
+    pub rev_lights: Option<RevLights>,
     /// ABS is currently active
     pub abs_active: bool,
     /// Traction control is currently active
@@ -203,5 +216,20 @@ mod tests {
         assert!(supported_zero.capabilities.throttle);
         assert!(!unsupported.capabilities.abs_activity);
         assert!(supported_zero.capabilities.abs_activity);
+    }
+
+    #[test]
+    fn unsupported_rev_lights_are_distinct_from_all_off() {
+        let unsupported = VehicleTelemetry::default();
+        let all_off = VehicleTelemetry {
+            rev_lights: Some(RevLights {
+                percent: 0,
+                bit_value: 0,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(unsupported.rev_lights, None);
+        assert_eq!(all_off.rev_lights, Some(RevLights::default()));
     }
 }

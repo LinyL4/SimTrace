@@ -117,6 +117,7 @@ pub struct SimTraceApp {
 
 impl SimTraceApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::renderer::f1_open_hud::install_font(&cc.egui_ctx);
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals(egui::Visuals {
             panel_fill: egui::Color32::TRANSPARENT,
@@ -540,7 +541,6 @@ impl eframe::App for SimTraceApp {
                                     &visualization.points,
                                     visualization.latest.as_ref(),
                                     &self.settings.graph,
-                                    &self.parsed_colors,
                                     self.settings.overlay.opacity,
                                     self.max_steering_angle,
                                 )
