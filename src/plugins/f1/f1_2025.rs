@@ -7,7 +7,7 @@ use crate::core::TelemetryData;
 use super::protocol::{self, DecoderState, VehicleFields, HEADER_LEN};
 
 pub const PACKET_FORMAT: u16 = 2025;
-const GAME_YEAR: u8 = 25;
+const GAME_YEARS: &[u8] = &[25];
 const MAX_CARS: usize = 22;
 const SESSION_PACKET_LEN: usize = 753;
 const LAP_PACKET_LEN: usize = 1285;
@@ -28,7 +28,7 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn decode(&mut self, bytes: &[u8]) -> Result<Option<TelemetryData>> {
-        let header = protocol::parse_header(bytes, PACKET_FORMAT, GAME_YEAR, MAX_CARS)?;
+        let header = protocol::parse_header(bytes, PACKET_FORMAT, GAME_YEARS, MAX_CARS)?;
         self.state.observe_session(header.session_uid);
         match header.packet_id {
             PACKET_SESSION => {
@@ -99,7 +99,7 @@ pub(super) fn test_telemetry_packet(player: usize, frame: u32) -> Vec<u8> {
 fn test_packet(id: u8, len: usize, player: usize, frame: u32) -> Vec<u8> {
     let mut bytes = vec![0_u8; len];
     bytes[0..2].copy_from_slice(&PACKET_FORMAT.to_le_bytes());
-    bytes[2] = GAME_YEAR;
+    bytes[2] = GAME_YEARS[0];
     bytes[5] = 1;
     bytes[6] = id;
     bytes[7..15].copy_from_slice(&1234_u64.to_le_bytes());

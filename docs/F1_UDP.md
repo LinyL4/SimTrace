@@ -2,6 +2,8 @@
 
 SimTrace uses one UDP listener and automatically selects a decoder from the packet format identifier. F1 25 UDP Format 2025 and the F1 25: 2026 Season Pack UDP Format 2026 are separate decoders with their own packet sizes and vehicle-array layouts. Native 2026 Season Pack output is supported; the game does not need to use its legacy F1 25 format.
 
+EA's 2026 structure document labels the 2026 header game-year value as `26`. A live F1 25: 2026 Season Pack build was observed sending packet format `2026` with game year `25` and game version `1.26`, while its packet IDs and lengths matched the documented 2026 layouts. The 2026 decoder therefore accepts game year `25` or `26` only after packet format `2026` selects that decoder. This compatibility allowance does not alter any packet layout or offset.
+
 The implementation follows EA's current official [F1 25 and 2026 Season Pack UDP specification page](https://forums.ea.com/blog/f1-games-game-info-hub-en/ea-sports%E2%84%A2-f1%C2%AE25-2026-season-pack-udp-specification/12187347), [F1 25 v3 specification](https://forums.ea.com/t5/s/tghpe58374/attachments/tghpe58374/f1-games-game-info-hub-en/61/4/Data%20Output%20from%20F1%2025%20v3.pdf), [F1 25 structures](https://forums.ea.com/t5/s/tghpe58374/attachments/tghpe58374/f1-games-game-info-hub-en/61/5/F1%2025%20Telemetry%20Output%20Structures.txt), and [2026 Season Pack structures](https://forums.ea.com/t5/s/tghpe58374/attachments/tghpe58374/f1-games-game-info-hub-en/61/8/2026%20Season%20Pack%20Telemetry%20Output%20Structures%20(1).txt).
 
 ## Direct game output

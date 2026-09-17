@@ -243,7 +243,7 @@ pub fn packet_format(bytes: &[u8]) -> Result<u16> {
 pub fn parse_header(
     bytes: &[u8],
     expected_format: u16,
-    expected_game_year: u8,
+    accepted_game_years: &[u8],
     max_cars: usize,
 ) -> Result<Header> {
     if bytes.len() < HEADER_LEN {
@@ -263,10 +263,10 @@ pub fn parse_header(
         ));
     }
     let game_year = bytes[2];
-    if game_year != 0 && game_year != expected_game_year {
+    if game_year != 0 && !accepted_game_years.contains(&game_year) {
         return Err(reject(
             RejectReason::GameYear,
-            format!("wrong F1 game year {game_year}; expected {expected_game_year}"),
+            format!("wrong F1 game year {game_year}; expected one of {accepted_game_years:?}"),
         ));
     }
     let player_car_index = bytes[27] as usize;
