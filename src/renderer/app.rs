@@ -1,6 +1,6 @@
 //! Main application
 
-use crate::config::{AppSettings, ParsedColors};
+use crate::config::{AppSettings, ParsedColors, UiLayoutMode};
 use crate::core::{DataCollector, LapStore, TelemetryBuffer};
 use crate::plugins::ProviderConfig;
 use eframe::egui;
@@ -112,6 +112,7 @@ pub struct SimTraceApp {
     trace_graph_cache: Arc<Mutex<crate::renderer::trace_graph::TraceGraphCache>>,
     phase_plot_cache: Arc<Mutex<crate::renderer::phase_plot::PhasePlotCache>>,
     track_strip_cache: Arc<Mutex<TrackStripCache>>,
+    f1_open_hud_cache: Arc<Mutex<crate::renderer::f1_open_hud::F1OpenHudCache>>,
 }
 
 impl SimTraceApp {
@@ -157,6 +158,7 @@ impl SimTraceApp {
             trace_graph_cache: Arc::new(Mutex::new(Default::default())),
             phase_plot_cache: Arc::new(Mutex::new(Default::default())),
             track_strip_cache: Arc::new(Mutex::new(Default::default())),
+            f1_open_hud_cache: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -290,6 +292,7 @@ impl eframe::App for SimTraceApp {
         let visualization = Arc::clone(&self.visualization_snapshot);
         let trace_graph_cache = Arc::clone(&self.trace_graph_cache);
         let track_strip_cache = Arc::clone(&self.track_strip_cache);
+        let f1_open_hud_cache = Arc::clone(&self.f1_open_hud_cache);
 
         let mut bar_animation_active = false;
         egui::CentralPanel::default()
@@ -300,6 +303,8 @@ impl eframe::App for SimTraceApp {
                 let a = (opacity * 255.0) as u8;
                 let bar_h = 26.0_f32;
                 let pad = 2.0_f32;
+                let f1_open_hud = self.settings.graph.layout_mode == UiLayoutMode::F1OpenHudBeta
+                    && is_f1_plugin(&self.settings.collector.plugin);
 
                 // ── Hover detection + bar fade ───────────────────────────────
                 let hovered = ctx.input(|i| {
@@ -360,7 +365,11 @@ impl eframe::App for SimTraceApp {
                 ui.painter().text(
                     egui::pos2(bar_rect.min.x + 10.0, bar_rect.center().y),
                     egui::Align2::LEFT_CENTER,
-                    "SIMTRACE",
+                    if f1_open_hud {
+                        "SIMTRACE  /  F1 OPEN HUD · BETA"
+                    } else {
+                        "SIMTRACE"
+                    },
                     egui::FontId::monospace(10.0),
                     with_alpha(LABEL_MID, ba),
                 );
@@ -502,18 +511,20 @@ impl eframe::App for SimTraceApp {
                 }
 
                 if !self.minimized {
-                    // ── Content card — stadium shape (rounded right cap) ─────────
+                    // ── Main content ─────────────────────────────────────────────
                     let content_rect = egui::Rect::from_min_max(
                         egui::pos2(screen.min.x + pad, screen.min.y + bar_h),
                         egui::pos2(screen.max.x - pad, screen.max.y - pad),
                     );
-                    // Cap radius: half the card height → perfect semicircle on the right
                     let cap_r = content_rect.height() / 2.0;
-                    ui.painter().add(egui::Shape::convex_polygon(
-                        stadium_path(content_rect, 5.0, cap_r),
-                        with_alpha(CARD_BG, a),
-                        egui::Stroke::new(1.0, with_alpha(BORDER, a)),
-                    ));
+                    if !f1_open_hud {
+                        // Classic keeps its stadium card; the Beta composition is open.
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            stadium_path(content_rect, 5.0, cap_r),
+                            with_alpha(CARD_BG, a),
+                            egui::Stroke::new(1.0, with_alpha(BORDER, a)),
+                        ));
+                    }
 
                     // Guard against the transition frame where the window hasn't
                     // resized yet (content_rect would have near-zero height).
@@ -524,19 +535,36 @@ impl eframe::App for SimTraceApp {
                                     .max_rect(content_rect.shrink(2.0))
                                     .layout(egui::Layout::top_down(egui::Align::LEFT)),
                             );
-                            draw_telemetry(
-                                &mut content_ui,
-                                &mut self.settings,
-                                &self.parsed_colors,
-                                &visualization,
-                                visualization_due,
-                                &trace_graph_cache,
-                                &track_strip_cache,
-                                self.current_steering,
-                                self.max_steering_angle,
-                                a,
-                                cap_r,
-                            );
+                            if f1_open_hud {
+                                crate::renderer::F1OpenHud::new(
+                                    &visualization.points,
+                                    visualization.latest.as_ref(),
+                                    &self.settings.graph,
+                                    &self.parsed_colors,
+                                    self.settings.overlay.opacity,
+                                    self.max_steering_angle,
+                                )
+                                .show(
+                                    &mut content_ui,
+                                    content_rect.shrink(2.0).size(),
+                                    visualization_due,
+                                    &mut f1_open_hud_cache.lock().unwrap(),
+                                );
+                            } else {
+                                draw_telemetry(
+                                    &mut content_ui,
+                                    &mut self.settings,
+                                    &self.parsed_colors,
+                                    &visualization,
+                                    visualization_due,
+                                    &trace_graph_cache,
+                                    &track_strip_cache,
+                                    self.current_steering,
+                                    self.max_steering_angle,
+                                    a,
+                                    cap_r,
+                                );
+                            }
                         } else {
                             let font_size = (content_rect.height() * 0.28).clamp(14.0, 42.0);
                             ui.painter().text(
@@ -771,6 +799,7 @@ impl eframe::App for SimTraceApp {
                 visualization_work_rate_hz =
                     self.visualization_work_since_report as f64 / elapsed_seconds,
                 visualization_cap_hz = VISUALIZATION_CAP_HZ,
+                layout_mode = ?self.settings.graph.layout_mode,
                 window_seconds = self.settings.graph.window_seconds,
                 phase_plot_open = self.settings.graph.phase_plot_open,
                 history_samples = self.buffer.len(),
@@ -1322,6 +1351,34 @@ fn draw_config(
 
     // ── Display ──────────────────────────────────────────────────────────────
     section_header(ui, "DISPLAY");
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Interface").size(11.0).color(LABEL_MID));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            egui::ComboBox::from_id_salt("layout_mode")
+                .selected_text(settings.graph.layout_mode.display_name())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut settings.graph.layout_mode,
+                        UiLayoutMode::Classic,
+                        UiLayoutMode::Classic.display_name(),
+                    );
+                    ui.add_enabled_ui(is_f1_plugin(&settings.collector.plugin), |ui| {
+                        ui.selectable_value(
+                            &mut settings.graph.layout_mode,
+                            UiLayoutMode::F1OpenHudBeta,
+                            UiLayoutMode::F1OpenHudBeta.display_name(),
+                        );
+                    });
+                });
+        });
+    });
+    if !is_f1_plugin(&settings.collector.plugin) {
+        ui.label(
+            egui::RichText::new("F1 Open HUD becomes available with the F1 provider")
+                .size(9.0)
+                .color(LABEL_DIM),
+        );
+    }
     ui.checkbox(&mut settings.graph.show_legend, "Show legend");
     ui.checkbox(&mut settings.graph.show_track_strip, "Show track strip");
     ui.horizontal(|ui| {
@@ -1489,6 +1546,10 @@ fn provider_config(settings: &AppSettings) -> ProviderConfig {
         f1_bind_address: settings.collector.f1_bind_address.trim().to_owned(),
         f1_udp_port: settings.collector.f1_udp_port,
     }
+}
+
+fn is_f1_plugin(plugin: &str) -> bool {
+    matches!(plugin, "f1" | "f1_25")
 }
 
 #[cfg(test)]

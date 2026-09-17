@@ -33,6 +33,9 @@ fn default_f1_udp_port() -> u16 {
 /// Graph visualization settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphSettings {
+    /// Selects the stable renderer or an experimental presentation layer.
+    #[serde(default)]
+    pub layout_mode: UiLayoutMode,
     /// Seconds of history shown in the trace graph.
     pub window_seconds: f64,
     pub show_grid: bool,
@@ -64,6 +67,23 @@ pub struct GraphSettings {
     pub lap_comparison_open: bool,
     pub show_tc: bool,
     pub show_speed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UiLayoutMode {
+    #[default]
+    Classic,
+    F1OpenHudBeta,
+}
+
+impl UiLayoutMode {
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::F1OpenHudBeta => "F1 Open HUD (Beta)",
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -173,6 +193,7 @@ impl Default for AppSettings {
                 f1_udp_port: default_f1_udp_port(),
             },
             graph: GraphSettings {
+                layout_mode: UiLayoutMode::Classic,
                 window_seconds: 10.0,
                 show_grid: true,
                 show_legend: true,
@@ -284,6 +305,7 @@ mod tests {
         assert_eq!(s.collector.plugin, "mock");
         assert_eq!(s.overlay.opacity, 1.0);
         assert_eq!(s.graph.window_seconds, 10.0);
+        assert_eq!(s.graph.layout_mode, UiLayoutMode::Classic);
     }
 
     #[test]
@@ -346,6 +368,7 @@ mod tests {
         let s: AppSettings = toml::from_str(toml_str).unwrap();
         assert_eq!(s.colors.clutch, default_clutch_color());
         assert!(!s.graph.speed_mph);
+        assert_eq!(s.graph.layout_mode, UiLayoutMode::Classic);
     }
 
     #[test]
@@ -386,5 +409,17 @@ mod tests {
         let restored: AppSettings = value.try_into().unwrap();
         let serialized = toml::to_string_pretty(&restored).unwrap();
         assert!(!serialized.contains("ui_fps"));
+    }
+
+    #[test]
+    fn f1_open_hud_layout_round_trips() {
+        let mut settings = AppSettings::default();
+        settings.graph.layout_mode = UiLayoutMode::F1OpenHudBeta;
+
+        let serialized = toml::to_string_pretty(&settings).unwrap();
+        let restored: AppSettings = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(restored.graph.layout_mode, UiLayoutMode::F1OpenHudBeta);
+        assert!(serialized.contains("layout_mode = \"f1_open_hud_beta\""));
     }
 }
