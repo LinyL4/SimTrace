@@ -6,6 +6,7 @@ use crate::plugins::ProviderConfig;
 use eframe::egui;
 use egui::color_picker::{color_edit_button_srgba, Alpha};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // The buffer is kept larger than the maximum display window so the slider can
 // show the full range without data disappearing at the top.
@@ -20,6 +21,44 @@ const MIN_HEIGHT: f32 = 130.0;
 const STRIP_H: f32 = 10.0;
 const STRIP_GAP: f32 = 3.0;
 const RUNTIME_COUNTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const VISUALIZATION_CAP_HZ: u64 = 60;
+const VISUALIZATION_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / VISUALIZATION_CAP_HZ);
+const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+
+struct VisualizationGate {
+    next_due: Instant,
+}
+
+impl VisualizationGate {
+    fn new(now: Instant) -> Self {
+        Self { next_due: now }
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if now < self.next_due {
+            return false;
+        }
+        self.next_due = now + VISUALIZATION_INTERVAL;
+        true
+    }
+
+    fn remaining(&self, now: Instant) -> Duration {
+        self.next_due.saturating_duration_since(now)
+    }
+}
+
+#[derive(Default)]
+struct VisualizationSnapshot {
+    latest: Option<crate::core::TelemetryPoint>,
+    points: Vec<crate::core::TelemetryPoint>,
+    analysis: LapStore,
+}
+
+#[derive(Default)]
+struct TrackStripCache {
+    rect: Option<egui::Rect>,
+    shapes: Vec<egui::Shape>,
+}
 
 // ── Background poller ─────────────────────────────────────────────────────────
 
@@ -67,10 +106,17 @@ pub struct SimTraceApp {
     last_update_at: std::time::Instant,
     runtime_counter_started_at: std::time::Instant,
     ui_updates_since_report: u64,
+    visualization_gate: VisualizationGate,
+    visualization_snapshot: Arc<VisualizationSnapshot>,
+    visualization_work_since_report: u64,
+    trace_graph_cache: Arc<Mutex<crate::renderer::trace_graph::TraceGraphCache>>,
+    phase_plot_cache: Arc<Mutex<crate::renderer::phase_plot::PhasePlotCache>>,
+    track_strip_cache: Arc<Mutex<TrackStripCache>>,
 }
 
 impl SimTraceApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals(egui::Visuals {
             panel_fill: egui::Color32::TRANSPARENT,
             window_fill: egui::Color32::TRANSPARENT,
@@ -84,6 +130,7 @@ impl SimTraceApp {
         let max_steering_angle = crate::plugins::create_plugin(&active_plugin, &provider_config)
             .map(|p| p.get_config().max_steering_angle)
             .unwrap_or(450.0);
+        let now = Instant::now();
         Self {
             settings,
             buffer: Arc::new(TelemetryBuffer::new(std::time::Duration::from_secs(
@@ -101,9 +148,15 @@ impl SimTraceApp {
             parsed_colors,
             analysis: Arc::new(Mutex::new(LapStore::new())),
             active_provider_config: provider_config,
-            last_update_at: std::time::Instant::now(),
-            runtime_counter_started_at: std::time::Instant::now(),
+            last_update_at: now,
+            runtime_counter_started_at: now,
             ui_updates_since_report: 0,
+            visualization_gate: VisualizationGate::new(now),
+            visualization_snapshot: Arc::new(VisualizationSnapshot::default()),
+            visualization_work_since_report: 0,
+            trace_graph_cache: Arc::new(Mutex::new(Default::default())),
+            phase_plot_cache: Arc::new(Mutex::new(Default::default())),
+            track_strip_cache: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -180,14 +233,6 @@ impl eframe::App for SimTraceApp {
             .as_secs_f32()
             .min(0.25);
         self.last_update_at = now;
-        // Force dark visuals every frame — prevents the OS light theme from
-        // overriding our settings (observed on Windows 11 with light mode).
-        ctx.set_visuals(egui::Visuals {
-            panel_fill: egui::Color32::TRANSPARENT,
-            window_fill: egui::Color32::TRANSPARENT,
-            ..egui::Visuals::dark()
-        });
-
         // Track window geometry for persistence (skip height when minimized)
         if let Some(inner) = ctx.input(|i| i.viewport().inner_rect) {
             self.settings.overlay.width = inner.width();
@@ -214,24 +259,39 @@ impl eframe::App for SimTraceApp {
             self.activate_plugin();
         }
 
-        // ── Read latest telemetry ────────────────────────────────────────────
-        if self.running {
-            if let Some(pt) = self.buffer.latest() {
-                self.current_steering = pt
+        // Window/compositor events may call App::update earlier than requested.
+        // Refresh telemetry-derived visualization state only at the fixed cap.
+        let visualization_due = self.visualization_gate.take_due(now);
+        if visualization_due {
+            let latest = self.running.then(|| self.buffer.latest()).flatten();
+            let window = Duration::from_secs_f64(self.settings.graph.window_seconds);
+            let points = if self.running {
+                self.buffer
+                    .get_points()
+                    .into_iter()
+                    .filter(|point| now.duration_since(point.captured_at) <= window)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let analysis = self.analysis.lock().unwrap().clone();
+            self.current_steering = latest.as_ref().map_or(0.0, |point| {
+                point
                     .telemetry
-                    .effective_steering_degrees(self.max_steering_angle);
-            }
+                    .effective_steering_degrees(self.max_steering_angle)
+            });
+            self.visualization_snapshot = Arc::new(VisualizationSnapshot {
+                latest,
+                points,
+                analysis,
+            });
+            self.visualization_work_since_report += 1;
         }
-        // Clone the Arc so the closure below can take &mut self freely.
-        let buffer = if self.running {
-            Some(self.buffer.clone())
-        } else {
-            None
-        };
-        // Clone the reference lap so the closure can read it without borrowing self.
-        let analysis_snapshot = self.analysis.lock().unwrap().clone();
-        let reference_lap = analysis_snapshot.reference_lap.clone();
+        let visualization = Arc::clone(&self.visualization_snapshot);
+        let trace_graph_cache = Arc::clone(&self.trace_graph_cache);
+        let track_strip_cache = Arc::clone(&self.track_strip_cache);
 
+        let mut bar_animation_active = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -257,6 +317,7 @@ impl eframe::App for SimTraceApp {
                 let rate = if target > self.bar_alpha { 16.0 } else { 5.0 };
                 let blend = 1.0 - (-rate * frame_dt).exp();
                 self.bar_alpha += (target - self.bar_alpha) * blend;
+                bar_animation_active = (target - self.bar_alpha).abs() > 0.001;
                 let ba = (a as f32 * self.bar_alpha) as u8;
 
                 // ── Title bar — same width as content card ───────────────────
@@ -467,12 +528,14 @@ impl eframe::App for SimTraceApp {
                                 &mut content_ui,
                                 &mut self.settings,
                                 &self.parsed_colors,
-                                buffer.as_ref(),
+                                &visualization,
+                                visualization_due,
+                                &trace_graph_cache,
+                                &track_strip_cache,
                                 self.current_steering,
                                 self.max_steering_angle,
                                 a,
                                 cap_r,
-                                reference_lap.as_deref(),
                             );
                         } else {
                             let font_size = (content_rect.height() * 0.28).clamp(14.0, 42.0);
@@ -546,8 +609,11 @@ impl eframe::App for SimTraceApp {
                             &mut self.settings,
                             &mut self.running,
                             &mut self.save_toast,
-                            buffer.as_ref(),
+                            visualization.latest.as_ref().is_some_and(|point| {
+                                point.captured_at.elapsed().as_secs_f32() <= 2.0
+                            }),
                             &self.analysis,
+                            &visualization.analysis,
                         );
                     });
                     // Re-derive parsed colors in case the color pickers changed them.
@@ -560,11 +626,12 @@ impl eframe::App for SimTraceApp {
 
         // ── Phase plot viewport ───────────────────────────────────────────────
         if self.settings.graph.phase_plot_open {
-            let buffer_arc = self.buffer.clone();
             let graph_settings = self.settings.graph.clone();
             let colors = self.parsed_colors.clone();
             let opacity = self.settings.overlay.opacity;
             let max_steering_angle = self.max_steering_angle;
+            let phase_plot_cache = Arc::clone(&self.phase_plot_cache);
+            let visualization = Arc::clone(&visualization);
 
             let close_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let close_arc = close_flag.clone();
@@ -583,13 +650,18 @@ impl eframe::App for SimTraceApp {
                         .show(ctx, |ui| {
                             let size = ui.available_size();
                             let closed = crate::renderer::PhasePlot::new(
-                                Some(&*buffer_arc),
+                                &visualization.points,
                                 &graph_settings,
                                 &colors,
                                 opacity,
                                 max_steering_angle,
                             )
-                            .show(ui, size);
+                            .show(
+                                ui,
+                                size,
+                                visualization_due,
+                                &mut phase_plot_cache.lock().unwrap(),
+                            );
                             if closed {
                                 close_arc.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -620,13 +692,13 @@ impl eframe::App for SimTraceApp {
 
         // ── Lap comparison viewport ───────────────────────────────────────────
         if self.settings.graph.lap_comparison_open {
-            let reference = analysis_snapshot.reference_lap.clone();
-            let current = analysis_snapshot.current_lap().to_vec();
-            let current_track_pos = analysis_snapshot
+            let current_track_pos = visualization
+                .analysis
                 .current_lap()
                 .last()
                 .map(|p| p.track_position)
                 .unwrap_or(0.0);
+            let visualization = Arc::clone(&visualization);
             let colors = self.parsed_colors.clone();
             let opacity = self.settings.overlay.opacity;
 
@@ -647,8 +719,8 @@ impl eframe::App for SimTraceApp {
                         .show(ctx, |ui| {
                             let size = ui.available_size();
                             let closed = crate::renderer::LapComparison::new(
-                                reference.as_ref(),
-                                &current,
+                                visualization.analysis.reference_lap.as_ref(),
+                                visualization.analysis.current_lap(),
                                 current_track_pos,
                                 &colors,
                                 opacity,
@@ -677,7 +749,18 @@ impl eframe::App for SimTraceApp {
                 let _ = self.settings.save_to_config_path();
             }
         }
-        ctx.request_repaint_after(render_interval(&self.settings));
+        let visualization_is_live = self.running
+            && visualization
+                .latest
+                .as_ref()
+                .is_some_and(|point| point.captured_at.elapsed() <= Duration::from_secs(2));
+        if visualization_is_live || bar_animation_active {
+            ctx.request_repaint_after(self.visualization_gate.remaining(Instant::now()));
+        } else if self.running {
+            // Stay responsive to a newly connected game without keeping an idle
+            // overlay in a forced 60 Hz loop.
+            ctx.request_repaint_after(IDLE_REPAINT_INTERVAL);
+        }
 
         let counter_elapsed = self.runtime_counter_started_at.elapsed();
         if counter_elapsed >= RUNTIME_COUNTER_INTERVAL {
@@ -685,17 +768,23 @@ impl eframe::App for SimTraceApp {
             tracing::info!(
                 interval_seconds = elapsed_seconds,
                 ui_update_rate_hz = self.ui_updates_since_report as f64 / elapsed_seconds,
-                configured_ui_fps = self.settings.graph.validated_ui_fps(),
+                visualization_work_rate_hz =
+                    self.visualization_work_since_report as f64 / elapsed_seconds,
+                visualization_cap_hz = VISUALIZATION_CAP_HZ,
                 window_seconds = self.settings.graph.window_seconds,
                 phase_plot_open = self.settings.graph.phase_plot_open,
                 history_samples = self.buffer.len(),
-                current_lap_samples = analysis_snapshot.sample_count(),
-                reference_lap_samples =
-                    analysis_snapshot.reference_lap.as_ref().map_or(0, Vec::len),
+                current_lap_samples = visualization.analysis.sample_count(),
+                reference_lap_samples = visualization
+                    .analysis
+                    .reference_lap
+                    .as_ref()
+                    .map_or(0, Vec::len),
                 "SimTrace runtime counters"
             );
             self.runtime_counter_started_at = std::time::Instant::now();
             self.ui_updates_since_report = 0;
+            self.visualization_work_since_report = 0;
         }
     }
 }
@@ -707,33 +796,29 @@ fn draw_telemetry(
     ui: &mut egui::Ui,
     settings: &mut AppSettings,
     colors: &ParsedColors,
-    buffer: Option<&Arc<crate::core::TelemetryBuffer>>,
+    visualization: &VisualizationSnapshot,
+    rebuild_visualization: bool,
+    trace_graph_cache: &Arc<Mutex<crate::renderer::trace_graph::TraceGraphCache>>,
+    track_strip_cache: &Arc<Mutex<TrackStripCache>>,
     current_steering: f32,
     max_steering_angle: f32,
     a: u8,
     cap_r: f32,
-    reference_lap: Option<&[crate::core::lap_store::LapPoint]>,
 ) {
     let opacity = settings.overlay.opacity;
     let available = ui.available_rect_before_wrap();
 
-    let latest = buffer.and_then(|b| b.latest());
+    let latest = visualization.latest.as_ref();
     let capabilities = latest
-        .as_ref()
         .map(|point| point.telemetry.capabilities)
         .unwrap_or_default();
-    let throttle = latest.as_ref().map(|p| p.telemetry.throttle).unwrap_or(0.0);
-    let brake = latest.as_ref().map(|p| p.telemetry.brake).unwrap_or(0.0);
-    let clutch = latest.as_ref().map(|p| p.telemetry.clutch).unwrap_or(0.0);
-    let abs_on =
-        capabilities.abs_activity && latest.as_ref().map(|p| p.abs_active).unwrap_or(false);
-    let tc_on = latest
-        .as_ref()
-        .map(|p| p.telemetry.tc_active)
-        .unwrap_or(false)
-        && capabilities.tc_activity;
-    let gear = latest.as_ref().map(|p| p.telemetry.gear).unwrap_or(0);
-    let speed_ms = latest.as_ref().map(|p| p.telemetry.speed).unwrap_or(0.0);
+    let throttle = latest.map(|p| p.telemetry.throttle).unwrap_or(0.0);
+    let brake = latest.map(|p| p.telemetry.brake).unwrap_or(0.0);
+    let clutch = latest.map(|p| p.telemetry.clutch).unwrap_or(0.0);
+    let abs_on = capabilities.abs_activity && latest.map(|p| p.abs_active).unwrap_or(false);
+    let tc_on = latest.map(|p| p.telemetry.tc_active).unwrap_or(false) && capabilities.tc_activity;
+    let gear = latest.map(|p| p.telemetry.gear).unwrap_or(0);
+    let speed_ms = latest.map(|p| p.telemetry.speed).unwrap_or(0.0);
 
     let bar_gap = 4.0_f32;
     let gap = 8.0_f32;
@@ -757,16 +842,19 @@ fn draw_telemetry(
     let graph_h = content_h;
 
     // No data arriving? Show overlay on graph area.
-    let is_waiting = latest
-        .as_ref()
-        .is_none_or(|p| p.captured_at.elapsed().as_secs_f32() > 2.0);
+    let is_waiting = latest.is_none_or(|p| p.captured_at.elapsed().as_secs_f32() > 2.0);
     let graph_rect = egui::Rect::from_min_size(available.min, egui::vec2(graph_w, graph_h));
 
     ui.spacing_mut().item_spacing.x = 0.0;
     ui.horizontal(|ui| {
         // ── Trace graph ──────────────────────────────────────────────────────
-        crate::renderer::TraceGraph::new(buffer.map(|v| &**v), &settings.graph, colors, opacity)
-            .show(ui, egui::vec2(graph_w, graph_h));
+        crate::renderer::TraceGraph::new(&visualization.points, &settings.graph, colors, opacity)
+            .show(
+                ui,
+                egui::vec2(graph_w, graph_h),
+                rebuild_visualization,
+                &mut trace_graph_cache.lock().unwrap(),
+            );
 
         // Gap between graph and bars
         ui.allocate_exact_size(egui::vec2(gap, content_h), egui::Sense::hover());
@@ -943,10 +1031,7 @@ fn draw_telemetry(
 
     // ── Track position strip ─────────────────────────────────────────────────
     if settings.graph.show_track_strip && capabilities.track_position {
-        let current_track_pos = latest
-            .as_ref()
-            .map(|p| p.telemetry.track_position)
-            .unwrap_or(0.0);
+        let current_track_pos = latest.map(|p| p.telemetry.track_position).unwrap_or(0.0);
         let strip_rect = egui::Rect::from_min_size(
             egui::pos2(available.min.x, available.max.y - STRIP_H),
             egui::vec2(available.width(), STRIP_H),
@@ -954,12 +1039,14 @@ fn draw_telemetry(
         draw_track_strip(
             ui.painter(),
             strip_rect,
-            buffer,
+            &visualization.points,
             current_track_pos,
             &settings.graph,
             colors,
             a,
-            reference_lap,
+            visualization.analysis.reference_lap.as_deref(),
+            rebuild_visualization,
+            &mut track_strip_cache.lock().unwrap(),
         );
     }
 
@@ -980,14 +1067,15 @@ fn draw_telemetry(
 fn draw_track_strip(
     painter: &egui::Painter,
     rect: egui::Rect,
-    buffer: Option<&Arc<crate::core::TelemetryBuffer>>,
+    points: &[crate::core::TelemetryPoint],
     current_pos: f32,
     settings: &crate::config::GraphSettings,
     colors: &ParsedColors,
     a: u8,
     reference_lap: Option<&[crate::core::lap_store::LapPoint]>,
+    rebuild_visualization: bool,
+    cache: &mut TrackStripCache,
 ) {
-    // Background
     painter.rect_filled(
         rect,
         2.0,
@@ -999,6 +1087,15 @@ fn draw_track_strip(
         egui::Stroke::new(0.5, with_alpha(BORDER, a)),
         egui::StrokeKind::Middle,
     );
+
+    let rect_changed = cache.rect != Some(rect);
+    if !rebuild_visualization && !rect_changed {
+        painter.extend(cache.shapes.iter().cloned());
+        return;
+    }
+
+    cache.rect = Some(rect);
+    cache.shapes.clear();
 
     // ── Reference lap ghost ─────────────────────────────────────────────────
     // Bin reference points by pixel column and take the max brake/throttle
@@ -1027,7 +1124,7 @@ fn draw_track_strip(
             if brake_bins[col] > 0.02 {
                 let h = (brake_bins[col] * inner_h).max(1.0);
                 let alpha = (ghost_opacity * brake_bins[col]).min(255.0) as u8;
-                painter.line_segment(
+                cache.shapes.push(egui::Shape::line_segment(
                     [
                         egui::pos2(x, rect.max.y - 1.0),
                         egui::pos2(x, rect.max.y - 1.0 - h),
@@ -1036,14 +1133,14 @@ fn draw_track_strip(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(br, bg, bb, alpha),
                     ),
-                );
+                ));
             }
 
             // Throttle: from top down
             if throttle_bins[col] > 0.02 {
                 let h = (throttle_bins[col] * inner_h).max(1.0);
                 let alpha = (ghost_opacity * throttle_bins[col]).min(255.0) as u8;
-                painter.line_segment(
+                cache.shapes.push(egui::Shape::line_segment(
                     [
                         egui::pos2(x, rect.min.y + 1.0),
                         egui::pos2(x, rect.min.y + 1.0 + h),
@@ -1052,23 +1149,18 @@ fn draw_track_strip(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(tr, tg, tb, alpha),
                     ),
-                );
+                ));
             }
         }
     }
 
     // Live brake and throttle blips from recent history.
-    if let Some(buf) = buffer {
-        let points = buf.get_points();
+    if !points.is_empty() {
         let now = std::time::Instant::now();
         let window_secs = settings.window_seconds as f32;
-        let window_dur = std::time::Duration::from_secs_f64(settings.window_seconds);
         let inner_h = rect.height() - 2.0;
 
-        for pt in points
-            .iter()
-            .filter(|p| now.duration_since(p.captured_at) <= window_dur)
-        {
+        for pt in points {
             let age = now.duration_since(pt.captured_at).as_secs_f32();
             let freshness = (1.0 - age / window_secs).clamp(0.0, 1.0);
             let x = rect.min.x + pt.telemetry.track_position * rect.width();
@@ -1084,13 +1176,13 @@ fn draw_track_strip(
                 let [r, g, b, ca] = color.to_array();
                 let alpha = ((ca as f32) * (a as f32 / 255.0) * brake_intensity).min(255.0) as u8;
                 let h = (pt.telemetry.brake * inner_h).max(1.0);
-                painter.line_segment(
+                cache.shapes.push(egui::Shape::line_segment(
                     [
                         egui::pos2(x, rect.max.y - 1.0),
                         egui::pos2(x, rect.max.y - 1.0 - h),
                     ],
                     egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)),
-                );
+                ));
             }
 
             // Throttle: from top down
@@ -1100,23 +1192,24 @@ fn draw_track_strip(
                 let alpha =
                     ((ca as f32) * (a as f32 / 255.0) * throttle_intensity).min(255.0) as u8;
                 let h = (pt.telemetry.throttle * inner_h).max(1.0);
-                painter.line_segment(
+                cache.shapes.push(egui::Shape::line_segment(
                     [
                         egui::pos2(x, rect.min.y + 1.0),
                         egui::pos2(x, rect.min.y + 1.0 + h),
                     ],
                     egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)),
-                );
+                ));
             }
         }
     }
 
     // Current position cursor — bright white vertical line.
     let cx = rect.min.x + current_pos.clamp(0.0, 1.0) * rect.width();
-    painter.line_segment(
+    cache.shapes.push(egui::Shape::line_segment(
         [egui::pos2(cx, rect.min.y), egui::pos2(cx, rect.max.y)],
         egui::Stroke::new(2.0, with_alpha(egui::Color32::WHITE, a)),
-    );
+    ));
+    painter.extend(cache.shapes.iter().cloned());
 }
 
 // ── Config panel ─────────────────────────────────────────────────────────────
@@ -1126,17 +1219,14 @@ fn draw_config(
     settings: &mut AppSettings,
     running: &mut bool,
     save_toast: &mut Option<std::time::Instant>,
-    buffer: Option<&Arc<crate::core::TelemetryBuffer>>,
+    is_live: bool,
     analysis: &Arc<Mutex<crate::core::LapStore>>,
+    analysis_snapshot: &crate::core::LapStore,
 ) {
     // Ensure all widgets (sliders, dropdowns, colour pickers) use dark styling
     // regardless of the OS theme reported by the platform layer.
     *ui.visuals_mut() = egui::Visuals::dark();
     ui.visuals_mut().override_text_color = Some(egui::Color32::from_gray(210));
-
-    let is_live = buffer
-        .and_then(|b| b.latest())
-        .is_some_and(|p| p.captured_at.elapsed().as_secs_f32() <= 2.0);
 
     // Status dot + label + stop/start + save (right-aligned) — all inline
     ui.horizontal(|ui| {
@@ -1234,22 +1324,6 @@ fn draw_config(
     section_header(ui, "DISPLAY");
     ui.checkbox(&mut settings.graph.show_legend, "Show legend");
     ui.checkbox(&mut settings.graph.show_track_strip, "Show track strip");
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("UI refresh")
-                .size(11.0)
-                .color(LABEL_MID),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            egui::ComboBox::from_id_salt("ui_fps")
-                .selected_text(format!("{} FPS", settings.graph.validated_ui_fps()))
-                .show_ui(ui, |ui| {
-                    for fps in crate::config::GraphSettings::VALID_UI_FPS {
-                        ui.selectable_value(&mut settings.graph.ui_fps, fps, format!("{fps} FPS"));
-                    }
-                });
-        });
-    });
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Speed unit")
@@ -1387,7 +1461,7 @@ fn draw_config(
         settings.graph.lap_comparison_open = !settings.graph.lap_comparison_open;
     }
     ui.add_space(4.0);
-    let ref_status = match &analysis.lock().unwrap().reference_lap {
+    let ref_status = match &analysis_snapshot.reference_lap {
         Some(pts) => format!("Ref: {} pts", pts.len()),
         None => "No reference lap".to_string(),
     };
@@ -1417,22 +1491,29 @@ fn provider_config(settings: &AppSettings) -> ProviderConfig {
     }
 }
 
-fn render_interval(settings: &AppSettings) -> std::time::Duration {
-    std::time::Duration::from_secs_f64(1.0 / settings.graph.validated_ui_fps() as f64)
-}
-
 #[cfg(test)]
 mod scheduling_tests {
     use super::*;
 
     #[test]
-    fn configured_refresh_rates_produce_timed_intervals() {
-        let mut settings = AppSettings::default();
-        for fps in crate::config::GraphSettings::VALID_UI_FPS {
-            settings.graph.ui_fps = fps;
-            let expected = 1.0 / fps as f64;
-            assert!((render_interval(&settings).as_secs_f64() - expected).abs() < 1e-9);
-        }
+    fn visualization_gate_never_runs_twice_inside_interval() {
+        let start = Instant::now();
+        let mut gate = VisualizationGate::new(start);
+
+        assert!(gate.take_due(start));
+        assert!(!gate.take_due(start + VISUALIZATION_INTERVAL / 2));
+        assert!(gate.take_due(start + VISUALIZATION_INTERVAL));
+    }
+
+    #[test]
+    fn late_visualization_does_not_schedule_catch_up_bursts() {
+        let start = Instant::now();
+        let mut gate = VisualizationGate::new(start);
+        assert!(gate.take_due(start));
+
+        let late = start + VISUALIZATION_INTERVAL * 5;
+        assert!(gate.take_due(late));
+        assert!(!gate.take_due(late + Duration::from_millis(1)));
     }
 }
 

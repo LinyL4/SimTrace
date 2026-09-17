@@ -64,24 +64,6 @@ pub struct GraphSettings {
     pub lap_comparison_open: bool,
     pub show_tc: bool,
     pub show_speed: bool,
-    #[serde(default = "default_ui_fps")]
-    pub ui_fps: u32,
-}
-
-fn default_ui_fps() -> u32 {
-    60
-}
-
-impl GraphSettings {
-    pub const VALID_UI_FPS: [u32; 4] = [30, 60, 90, 120];
-
-    pub fn validated_ui_fps(&self) -> u32 {
-        if Self::VALID_UI_FPS.contains(&self.ui_fps) {
-            self.ui_fps
-        } else {
-            default_ui_fps()
-        }
-    }
 }
 
 fn default_true() -> bool {
@@ -208,7 +190,6 @@ impl Default for AppSettings {
                 lap_comparison_open: false,
                 show_tc: true,
                 show_speed: true,
-                ui_fps: default_ui_fps(),
             },
             colors: ColorScheme {
                 throttle: "#00FF00".to_string(),
@@ -303,7 +284,6 @@ mod tests {
         assert_eq!(s.collector.plugin, "mock");
         assert_eq!(s.overlay.opacity, 1.0);
         assert_eq!(s.graph.window_seconds, 10.0);
-        assert_eq!(s.graph.validated_ui_fps(), 60);
     }
 
     #[test]
@@ -366,7 +346,6 @@ mod tests {
         let s: AppSettings = toml::from_str(toml_str).unwrap();
         assert_eq!(s.colors.clutch, default_clutch_color());
         assert!(!s.graph.speed_mph);
-        assert_eq!(s.graph.validated_ui_fps(), 60);
     }
 
     #[test]
@@ -396,13 +375,16 @@ mod tests {
     }
 
     #[test]
-    fn render_rate_is_validated() {
-        let mut settings = AppSettings::default();
-        for fps in GraphSettings::VALID_UI_FPS {
-            settings.graph.ui_fps = fps;
-            assert_eq!(settings.graph.validated_ui_fps(), fps);
-        }
-        settings.graph.ui_fps = 75;
-        assert_eq!(settings.graph.validated_ui_fps(), 60);
+    fn legacy_ui_fps_field_is_ignored() {
+        let mut value = toml::Value::try_from(AppSettings::default()).unwrap();
+        value
+            .get_mut("graph")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap()
+            .insert("ui_fps".to_owned(), toml::Value::Integer(120));
+
+        let restored: AppSettings = value.try_into().unwrap();
+        let serialized = toml::to_string_pretty(&restored).unwrap();
+        assert!(!serialized.contains("ui_fps"));
     }
 }

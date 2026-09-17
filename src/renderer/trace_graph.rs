@@ -7,7 +7,14 @@
 use egui::{Color32, Pos2, Rect, Response, Stroke, Ui, Vec2};
 
 use crate::config::{GraphSettings, ParsedColors};
-use crate::core::{TelemetryBuffer, TelemetryPoint};
+use crate::core::TelemetryPoint;
+
+#[derive(Default)]
+pub struct TraceGraphCache {
+    rect: Option<Rect>,
+    shapes: Vec<egui::Shape>,
+    speed_label: Option<String>,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum BrakeState {
@@ -25,7 +32,7 @@ enum ThrottleState {
 
 /// Renders a scrolling trace of pedal inputs against time.
 pub struct TraceGraph<'a> {
-    buffer: Option<&'a TelemetryBuffer>,
+    points: &'a [TelemetryPoint],
     settings: &'a GraphSettings,
     colors: &'a ParsedColors,
     opacity: f32,
@@ -33,20 +40,26 @@ pub struct TraceGraph<'a> {
 
 impl<'a> TraceGraph<'a> {
     pub fn new(
-        buffer: Option<&'a TelemetryBuffer>,
+        points: &'a [TelemetryPoint],
         settings: &'a GraphSettings,
         colors: &'a ParsedColors,
         opacity: f32,
     ) -> Self {
         Self {
-            buffer,
+            points,
             settings,
             colors,
             opacity,
         }
     }
 
-    pub fn show(&self, ui: &mut Ui, size: Vec2) -> Response {
+    pub fn show(
+        &self,
+        ui: &mut Ui,
+        size: Vec2,
+        rebuild_visualization: bool,
+        cache: &mut TraceGraphCache,
+    ) -> Response {
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::empty());
         let painter = ui.painter().with_clip_rect(rect);
 
@@ -56,28 +69,28 @@ impl<'a> TraceGraph<'a> {
             self.draw_grid(&painter, rect);
         }
 
-        if let Some(buffer) = self.buffer {
+        let rect_changed = cache.rect != Some(rect);
+        if rebuild_visualization || rect_changed {
+            cache.rect = Some(rect);
+            cache.shapes.clear();
+            cache.speed_label = None;
             let now = std::time::Instant::now();
             let window_dur = std::time::Duration::from_secs_f64(self.settings.window_seconds);
-            let points: Vec<TelemetryPoint> = buffer
-                .get_points()
-                .into_iter()
-                .filter(|p| now.duration_since(p.captured_at) <= window_dur)
-                .collect();
 
-            if !points.is_empty() {
-                let capabilities = points.last().unwrap().telemetry.capabilities;
+            if !self.points.is_empty() {
+                let capabilities = self.points.last().unwrap().telemetry.capabilities;
                 // Draw order: speed → clutch → throttle → brake/ABS (top, always visible)
                 if self.settings.show_speed && capabilities.speed {
-                    let max_speed = points
+                    let max_speed = self
+                        .points
                         .iter()
                         .map(|p| p.telemetry.speed)
                         .fold(0.0_f32, f32::max);
                     if max_speed > 0.5 {
-                        self.draw_trace(
-                            &painter,
+                        self.build_trace(
+                            &mut cache.shapes,
                             rect,
-                            &points,
+                            self.points,
                             now,
                             window_dur,
                             |p| p.telemetry.speed / max_speed,
@@ -94,21 +107,14 @@ impl<'a> TraceGraph<'a> {
                         } else {
                             "kph"
                         };
-                        let label_color = self.apply_opacity(self.colors.speed);
-                        painter.text(
-                            Pos2::new(rect.max.x - 4.0, rect.min.y + 4.0),
-                            egui::Align2::RIGHT_TOP,
-                            format!("{:.0} {}", speed_val, unit),
-                            egui::FontId::proportional(9.0),
-                            label_color,
-                        );
+                        cache.speed_label = Some(format!("{:.0} {}", speed_val, unit));
                     }
                 }
                 if self.settings.show_clutch && capabilities.clutch {
-                    self.draw_trace(
-                        &painter,
+                    self.build_trace(
+                        &mut cache.shapes,
                         rect,
-                        &points,
+                        self.points,
                         now,
                         window_dur,
                         |p| p.telemetry.clutch,
@@ -116,12 +122,28 @@ impl<'a> TraceGraph<'a> {
                     );
                 }
                 if self.settings.show_throttle && capabilities.throttle {
-                    self.draw_throttle_trace(&painter, rect, &points, now, window_dur);
+                    self.build_throttle_trace(
+                        &mut cache.shapes,
+                        rect,
+                        self.points,
+                        now,
+                        window_dur,
+                    );
                 }
                 if self.settings.show_brake && capabilities.brake {
-                    self.draw_brake_trace(&painter, rect, &points, now, window_dur);
+                    self.build_brake_trace(&mut cache.shapes, rect, self.points, now, window_dur);
                 }
             }
+        }
+        painter.extend(cache.shapes.iter().cloned());
+        if let Some(label) = &cache.speed_label {
+            painter.text(
+                Pos2::new(rect.max.x - 4.0, rect.min.y + 4.0),
+                egui::Align2::RIGHT_TOP,
+                label,
+                egui::FontId::proportional(9.0),
+                self.apply_opacity(self.colors.speed),
+            );
         }
 
         if self.settings.show_legend {
@@ -150,9 +172,9 @@ impl<'a> TraceGraph<'a> {
 
     /// Draw a single-colour trace for any scalar telemetry value.
     #[allow(clippy::too_many_arguments)]
-    fn draw_trace(
+    fn build_trace(
         &self,
-        painter: &egui::Painter,
+        shapes: &mut Vec<egui::Shape>,
         rect: Rect,
         points: &[TelemetryPoint],
         now: std::time::Instant,
@@ -171,14 +193,14 @@ impl<'a> TraceGraph<'a> {
             })
             .collect();
         if line_points.len() > 1 {
-            painter.add(egui::Shape::line(line_points, stroke));
+            shapes.push(egui::Shape::line(line_points, stroke));
         }
     }
 
     /// Draw the throttle trace, colouring segments by TC state.
-    fn draw_throttle_trace(
+    fn build_throttle_trace(
         &self,
-        painter: &egui::Painter,
+        shapes: &mut Vec<egui::Shape>,
         rect: Rect,
         points: &[TelemetryPoint],
         now: std::time::Instant,
@@ -233,7 +255,7 @@ impl<'a> TraceGraph<'a> {
                 ThrottleState::Normal => self.colors.throttle,
                 ThrottleState::TcActive => self.colors.tc_active,
             };
-            painter.add(egui::Shape::line(
+            shapes.push(egui::Shape::line(
                 seg_pts,
                 Stroke::new(self.settings.line_width, self.apply_opacity(color)),
             ));
@@ -241,9 +263,9 @@ impl<'a> TraceGraph<'a> {
     }
 
     /// Draw the brake trace, colouring segments by trail braking / ABS state.
-    fn draw_brake_trace(
+    fn build_brake_trace(
         &self,
-        painter: &egui::Painter,
+        shapes: &mut Vec<egui::Shape>,
         rect: Rect,
         points: &[TelemetryPoint],
         now: std::time::Instant,
@@ -337,7 +359,7 @@ impl<'a> TraceGraph<'a> {
                     }
                 }
             };
-            painter.add(egui::Shape::line(
+            shapes.push(egui::Shape::line(
                 seg_pts,
                 Stroke::new(self.settings.line_width, self.apply_opacity(color)),
             ));

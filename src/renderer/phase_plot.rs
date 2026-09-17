@@ -1,13 +1,19 @@
 //! Brake vs steering phase plot — shows trail braking shape as an X-Y scatter.
 
-use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
-use std::time::Duration;
-
 use crate::config::{GraphSettings, ParsedColors};
-use crate::core::TelemetryBuffer;
+use crate::core::TelemetryPoint;
+use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
+
+#[derive(Default)]
+pub struct PhasePlotCache {
+    rect: Option<Rect>,
+    shapes: Vec<egui::Shape>,
+    effective_steer_max: f32,
+    has_data: bool,
+}
 
 pub struct PhasePlot<'a> {
-    buffer: Option<&'a TelemetryBuffer>,
+    points: &'a [TelemetryPoint],
     settings: &'a GraphSettings,
     colors: &'a ParsedColors,
     opacity: f32,
@@ -16,14 +22,14 @@ pub struct PhasePlot<'a> {
 
 impl<'a> PhasePlot<'a> {
     pub fn new(
-        buffer: Option<&'a TelemetryBuffer>,
+        points: &'a [TelemetryPoint],
         settings: &'a GraphSettings,
         colors: &'a ParsedColors,
         opacity: f32,
         max_steering_angle: f32,
     ) -> Self {
         Self {
-            buffer,
+            points,
             settings,
             colors,
             opacity,
@@ -32,10 +38,16 @@ impl<'a> PhasePlot<'a> {
     }
 
     /// Returns `true` if the close button was clicked.
-    pub fn show(&self, ui: &mut egui::Ui, size: Vec2) -> bool {
+    pub fn show(
+        &self,
+        ui: &mut egui::Ui,
+        size: Vec2,
+        rebuild_visualization: bool,
+        cache: &mut PhasePlotCache,
+    ) -> bool {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::empty());
         let painter = ui.painter().with_clip_rect(rect);
-        self.draw(&painter, rect);
+        self.draw(&painter, rect, rebuild_visualization, cache);
 
         // Close button — handled here so we can tint on hover.
         let close_center = Pos2::new(rect.max.x - 14.0, rect.min.y + 12.0);
@@ -60,24 +72,30 @@ impl<'a> PhasePlot<'a> {
         close_resp.clicked()
     }
 
-    fn draw(&self, painter: &Painter, rect: Rect) {
+    fn draw(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        rebuild_visualization: bool,
+        cache: &mut PhasePlotCache,
+    ) {
         // Compute the effective steering range from recent data so the X axis
         // auto-scales to what the driver is actually using.  A floor of 5 % of
         // hardware max prevents the axis from over-zooming on tiny/noisy inputs.
         let steer_floor = (self.max_steering_angle * 0.05).max(5.0);
-        let effective_steer_max = self
-            .buffer
-            .map(|buf| {
-                let now = std::time::Instant::now();
-                let window_dur = Duration::from_secs_f64(self.settings.window_seconds);
-                buf.get_points()
-                    .into_iter()
-                    .filter(|p| now.duration_since(p.captured_at) <= window_dur)
-                    .map(|p| p.telemetry.steering_angle.abs())
-                    .fold(0.0_f32, f32::max)
-                    .max(steer_floor)
-            })
-            .unwrap_or(steer_floor);
+        let rect_changed = cache.rect != Some(rect);
+        if rebuild_visualization || rect_changed {
+            cache.rect = Some(rect);
+            cache.effective_steer_max = self
+                .points
+                .iter()
+                .map(|p| p.telemetry.steering_angle.abs())
+                .fold(0.0_f32, f32::max)
+                .max(steer_floor);
+            cache.shapes.clear();
+            cache.has_data = false;
+        }
+        let effective_steer_max = cache.effective_steer_max.max(steer_floor);
 
         let bg = self.apply_opacity(self.colors.background);
 
@@ -197,18 +215,16 @@ impl<'a> PhasePlot<'a> {
             text_color,
         );
 
-        // Data.
-        let Some(buffer) = self.buffer else {
-            self.draw_no_data(painter, plot);
+        if !rebuild_visualization && !rect_changed {
+            painter.extend(cache.shapes.iter().cloned());
+            if !cache.has_data {
+                self.draw_no_data(painter, plot);
+            }
             return;
-        };
+        }
+
+        // Data.
         let now = std::time::Instant::now();
-        let window_dur = Duration::from_secs_f64(self.settings.window_seconds);
-        let points: Vec<_> = buffer
-            .get_points()
-            .into_iter()
-            .filter(|p| now.duration_since(p.captured_at) <= window_dur)
-            .collect();
 
         let steering_threshold = self.settings.trail_brake_threshold;
 
@@ -220,7 +236,8 @@ impl<'a> PhasePlot<'a> {
         // Build a flat list of (screen pos, base colour, age-based freshness)
         // for braking points only. Non-braking points are skipped to avoid
         // drawing a red line along the bottom of the plot.
-        let brake_pts: Vec<(Pos2, Color32, f32)> = points
+        let brake_pts: Vec<(Pos2, Color32, f32)> = self
+            .points
             .iter()
             .filter(|p| p.telemetry.brake > 0.01)
             .map(|point| {
@@ -249,6 +266,7 @@ impl<'a> PhasePlot<'a> {
             self.draw_no_data(painter, plot);
             return;
         }
+        cache.has_data = true;
 
         // Draw each consecutive pair with alpha = freshness^1.5 so the tail
         // fades smoothly to nothing. After brake release the points age out
@@ -260,11 +278,12 @@ impl<'a> PhasePlot<'a> {
             let fade = freshness.powf(1.5);
             let [r, g, b, a] = color.to_array();
             let alpha = ((a as f32) * self.opacity * fade) as u8;
-            painter.line_segment(
+            cache.shapes.push(egui::Shape::line_segment(
                 [p0, p1],
                 Stroke::new(lw, Color32::from_rgba_unmultiplied(r, g, b, alpha)),
-            );
+            ));
         }
+        painter.extend(cache.shapes.iter().cloned());
     }
 
     fn draw_no_data(&self, painter: &Painter, plot: Rect) {
