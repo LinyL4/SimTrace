@@ -24,6 +24,7 @@ A demo of SimTrace in action showing the (toggleable) braking x steering phase p
 | Assetto Corsa Competizione |                                          |
 | Automobilista 2            | [Enable shared memory](#automobilista-2) |
 | iRacing                    | Support is currently experimental        |
+| EA SPORTS F1 25            | [UDP 2025 and 2026 Season Pack](docs/F1_UDP.md) |
 
 ## Installation
 
@@ -41,6 +42,10 @@ The overlay fades out when your cursor leaves it and reappears on hover.
 ## Automobilista 2
 
 Enable shared memory: (from the main menu) `Options (top right) > System > Shared Memory` and setting it to `Project CARS 2`
+
+## EA SPORTS F1 25
+
+SimTrace accepts native UDP from both F1 25 and the 2026 Season Pack. The listen address and port are saved with the other settings. See the [F1 UDP setup guide](docs/F1_UDP.md) for direct and forwarded configurations.
 
 ## Building from source
 
