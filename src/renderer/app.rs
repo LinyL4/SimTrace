@@ -113,6 +113,7 @@ pub struct SimTraceApp {
     phase_plot_cache: Arc<Mutex<crate::renderer::phase_plot::PhasePlotCache>>,
     track_strip_cache: Arc<Mutex<TrackStripCache>>,
     f1_open_hud_cache: Arc<Mutex<crate::renderer::f1_open_hud::F1OpenHudCache>>,
+    f1_glow_available: bool,
 }
 
 impl SimTraceApp {
@@ -133,6 +134,8 @@ impl SimTraceApp {
             .map(|p| p.get_config().max_steering_angle)
             .unwrap_or(450.0);
         let now = Instant::now();
+        let f1_glow_available =
+            crate::renderer::f1_glow_wgpu::install(cc.wgpu_render_state.as_ref());
         Self {
             settings,
             buffer: Arc::new(TelemetryBuffer::new(std::time::Duration::from_secs(
@@ -160,6 +163,7 @@ impl SimTraceApp {
             phase_plot_cache: Arc::new(Mutex::new(Default::default())),
             track_strip_cache: Arc::new(Mutex::new(Default::default())),
             f1_open_hud_cache: Arc::new(Mutex::new(Default::default())),
+            f1_glow_available,
         }
     }
 
@@ -548,6 +552,7 @@ impl eframe::App for SimTraceApp {
                                     &mut content_ui,
                                     content_rect.shrink(2.0).size(),
                                     visualization_due,
+                                    self.f1_glow_available,
                                     &mut f1_open_hud_cache.lock().unwrap(),
                                 );
                             } else {

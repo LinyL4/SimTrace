@@ -5,6 +5,7 @@
 
 use crate::config::GraphSettings;
 use crate::core::{RevLights, TelemetryPoint};
+use crate::renderer::f1_glow_wgpu::{self, GlowBatch, GlowBatchBuilder};
 use egui::{
     Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Painter, Pos2, Rect, Shape,
     Stroke, Vec2,
@@ -58,7 +59,10 @@ fn display_font(size: f32) -> FontId {
 #[derive(Default)]
 pub struct F1OpenHudCache {
     rect: Option<Rect>,
-    shapes: Vec<Shape>,
+    sharp_shapes: Vec<Shape>,
+    fallback_emission_shapes: Vec<Shape>,
+    glow_batch: GlowBatch,
+    generation: u64,
     brake_head: Option<Pos2>,
     throttle_head: Option<Pos2>,
     speed_head: Option<Pos2>,
@@ -112,6 +116,7 @@ impl<'a> F1OpenHud<'a> {
         ui: &mut egui::Ui,
         size: Vec2,
         rebuild_visualization: bool,
+        additive_glow_available: bool,
         cache: &mut F1OpenHudCache,
     ) {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::empty());
@@ -122,20 +127,29 @@ impl<'a> F1OpenHud<'a> {
             self.rebuild(rect, cache);
         }
 
-        painter.extend(cache.shapes.iter().cloned());
-        self.draw_labels(&painter, rect, cache);
+        let use_additive = additive_glow_available && !cache.glow_batch.is_empty();
+        if use_additive {
+            painter.add(f1_glow_wgpu::callback(rect, cache.glow_batch.clone()));
+        } else {
+            painter.extend(cache.fallback_emission_shapes.iter().cloned());
+        }
+        painter.extend(cache.sharp_shapes.iter().cloned());
+        self.draw_labels(&painter, rect, cache, use_additive);
     }
 
     fn rebuild(&self, rect: Rect, cache: &mut F1OpenHudCache) {
         cache.rect = Some(rect);
-        cache.shapes.clear();
+        cache.sharp_shapes.clear();
+        cache.fallback_emission_shapes.clear();
         cache.brake_head = None;
         cache.throttle_head = None;
         cache.speed_head = None;
         cache.values = self.formatted_values();
+        cache.generation = cache.generation.wrapping_add(1);
+        let mut glow = GlowBatchBuilder::new(rect);
 
         let layout = OpenHudLayout::new(rect);
-        self.build_grid(layout.trace_rect, &mut cache.shapes);
+        self.build_grid(layout.trace_rect, &mut cache.sharp_shapes);
 
         let capabilities = self.latest.map(|point| point.telemetry.capabilities);
         let mut brake_bands: [Vec<Pos2>; HISTORY_BANDS] = std::array::from_fn(|_| Vec::new());
@@ -200,38 +214,78 @@ impl<'a> F1OpenHud<'a> {
         }
 
         if capabilities.is_some_and(|value| value.brake) {
-            self.build_trace_layers(brake_bands, BRAKE_COLOR, true, &mut cache.shapes);
+            self.build_trace_layers(
+                brake_bands,
+                BRAKE_COLOR,
+                true,
+                true,
+                &mut cache.sharp_shapes,
+                &mut cache.fallback_emission_shapes,
+                &mut glow,
+            );
         }
         if capabilities.is_some_and(|value| value.throttle) {
-            self.build_trace_layers(throttle_bands, THROTTLE_COLOR, true, &mut cache.shapes);
+            self.build_trace_layers(
+                throttle_bands,
+                THROTTLE_COLOR,
+                true,
+                true,
+                &mut cache.sharp_shapes,
+                &mut cache.fallback_emission_shapes,
+                &mut glow,
+            );
         }
         if capabilities.is_some_and(|value| value.speed) {
-            self.build_trace_layers(speed_bands, SPEED_COLOR, false, &mut cache.shapes);
+            self.build_trace_layers(
+                speed_bands,
+                SPEED_COLOR,
+                false,
+                false,
+                &mut cache.sharp_shapes,
+                &mut cache.fallback_emission_shapes,
+                &mut glow,
+            );
+        }
+
+        for (head, color) in [
+            (cache.brake_head, BRAKE_COLOR),
+            (cache.throttle_head, THROTTLE_COLOR),
+        ] {
+            if let Some(head) = head {
+                glow.radial(head, 15.0, color, self.opacity * 0.34);
+            }
         }
 
         self.build_pedal_meter(
             layout.brake_meter_rect,
             cache.values.brake_level,
             BRAKE_COLOR,
-            &mut cache.shapes,
+            &mut cache.sharp_shapes,
+            &mut cache.fallback_emission_shapes,
+            &mut glow,
         );
         self.build_pedal_meter(
             layout.throttle_meter_rect,
             cache.values.throttle_level,
             THROTTLE_COLOR,
-            &mut cache.shapes,
+            &mut cache.sharp_shapes,
+            &mut cache.fallback_emission_shapes,
+            &mut glow,
         );
         self.build_steering_arc(
             layout.steering_rect,
             cache.values.steering_level,
-            &mut cache.shapes,
+            &mut cache.sharp_shapes,
         );
 
         self.build_rev_lights(
             layout.center_rect,
             cache.values.rev_lights,
-            &mut cache.shapes,
+            &mut cache.sharp_shapes,
+            &mut cache.fallback_emission_shapes,
+            &mut glow,
         );
+        cache.glow_batch = glow.finish(cache.generation);
     }
 
     fn build_trace_layers(
@@ -239,7 +293,10 @@ impl<'a> F1OpenHud<'a> {
         bands: [Vec<Pos2>; HISTORY_BANDS],
         color: Color32,
         primary: bool,
-        shapes: &mut Vec<Shape>,
+        additive_emission: bool,
+        sharp_shapes: &mut Vec<Shape>,
+        fallback_emission_shapes: &mut Vec<Shape>,
+        glow: &mut GlowBatchBuilder,
     ) {
         for (band, points) in bands.into_iter().enumerate() {
             if points.len() < 2 {
@@ -262,19 +319,29 @@ impl<'a> F1OpenHud<'a> {
             } else {
                 (6.0, 0.035, 3.2, 0.09, 1.55, 0.62, 0.6, 0.58)
             };
-            shapes.push(Shape::line(
+            let emission_shapes = if additive_emission {
+                &mut *fallback_emission_shapes
+            } else {
+                &mut *sharp_shapes
+            };
+            emission_shapes.push(Shape::line(
                 points.clone(),
                 Stroke::new(outer_width, with_opacity(color, energy * outer_alpha)),
             ));
-            shapes.push(Shape::line(
+            emission_shapes.push(Shape::line(
                 points.clone(),
                 Stroke::new(inner_width, with_opacity(color, energy * inner_alpha)),
             ));
-            shapes.push(Shape::line(
+            if additive_emission {
+                for segment in points.windows(2) {
+                    glow.ribbon_segment(segment[0], segment[1], 7.5, color, energy * 0.30);
+                }
+            }
+            sharp_shapes.push(Shape::line(
                 points.clone(),
                 Stroke::new(body_width, with_opacity(color, energy * body_alpha)),
             ));
-            shapes.push(Shape::line(
+            sharp_shapes.push(Shape::line(
                 points,
                 Stroke::new(core_width, with_opacity(hot, energy * core_alpha)),
             ));
@@ -309,7 +376,9 @@ impl<'a> F1OpenHud<'a> {
         rect: Rect,
         level: Option<f32>,
         color: Color32,
-        shapes: &mut Vec<Shape>,
+        sharp_shapes: &mut Vec<Shape>,
+        fallback_emission_shapes: &mut Vec<Shape>,
+        glow: &mut GlowBatchBuilder,
     ) {
         let Some(level) = level else {
             return;
@@ -332,8 +401,10 @@ impl<'a> F1OpenHud<'a> {
             } else {
                 SegmentState::Inactive
             };
-            push_luminous_segment(
-                shapes,
+            push_additive_segment(
+                sharp_shapes,
+                fallback_emission_shapes,
+                glow,
                 SegmentGeometry::Rect(segment, 1.2),
                 color,
                 state,
@@ -401,7 +472,14 @@ impl<'a> F1OpenHud<'a> {
         }
     }
 
-    fn build_rev_lights(&self, rect: Rect, rev_lights: Option<RevLights>, shapes: &mut Vec<Shape>) {
+    fn build_rev_lights(
+        &self,
+        rect: Rect,
+        rev_lights: Option<RevLights>,
+        sharp_shapes: &mut Vec<Shape>,
+        fallback_emission_shapes: &mut Vec<Shape>,
+        glow: &mut GlowBatchBuilder,
+    ) {
         let Some(rev_lights) = rev_lights else {
             return;
         };
@@ -424,8 +502,10 @@ impl<'a> F1OpenHud<'a> {
             } else {
                 SegmentState::Inactive
             };
-            push_luminous_segment(
-                shapes,
+            push_additive_segment(
+                sharp_shapes,
+                fallback_emission_shapes,
+                glow,
                 SegmentGeometry::Rect(segment, 0.9),
                 base,
                 state,
@@ -497,13 +577,34 @@ impl<'a> F1OpenHud<'a> {
         }
     }
 
-    fn draw_labels(&self, painter: &Painter, rect: Rect, cache: &F1OpenHudCache) {
+    fn draw_labels(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        cache: &F1OpenHudCache,
+        additive_glow_active: bool,
+    ) {
         let layout = OpenHudLayout::new(rect);
         let alpha = self.opacity;
         let label_font = display_font(12.5);
         let value_font = display_font(14.0);
         let label_top = layout.trace_rect.min.y + 13.0;
         let label_step = 24.0;
+
+        for (head, color, strength, migrated) in [
+            (cache.brake_head, BRAKE_COLOR, 1.0, true),
+            (cache.throttle_head, THROTTLE_COLOR, 1.0, true),
+            (cache.speed_head, SPEED_COLOR, 0.68, false),
+        ] {
+            if let Some(head) = head {
+                if additive_glow_active && migrated {
+                    draw_head_core(painter, head, color, alpha * strength);
+                } else {
+                    draw_head(painter, head, color, alpha * strength);
+                }
+            }
+        }
+
         let channels = [
             ("BRAKE", &cache.values.brake, BRAKE_COLOR),
             ("THROTTLE", &cache.values.throttle, THROTTLE_COLOR),
@@ -534,16 +635,6 @@ impl<'a> F1OpenHud<'a> {
                 alpha * if index == 2 { 0.78 } else { 1.0 },
                 TextClass::Channel,
             );
-        }
-
-        for (head, color, strength) in [
-            (cache.brake_head, BRAKE_COLOR, 1.0),
-            (cache.throttle_head, THROTTLE_COLOR, 1.0),
-            (cache.speed_head, SPEED_COLOR, 0.68),
-        ] {
-            if let Some(head) = head {
-                draw_head(painter, head, color, alpha * strength);
-            }
         }
 
         for division in 0..=GRID_DIVISIONS {
@@ -814,6 +905,74 @@ enum SegmentGeometry {
     Polygon(Vec<Pos2>),
 }
 
+fn push_additive_segment(
+    sharp_shapes: &mut Vec<Shape>,
+    fallback_emission_shapes: &mut Vec<Shape>,
+    glow: &mut GlowBatchBuilder,
+    geometry: SegmentGeometry,
+    color: Color32,
+    state: SegmentState,
+    opacity: f32,
+) {
+    let SegmentGeometry::Rect(rect, rounding) = geometry else {
+        unreachable!("the additive proof-of-concept only migrates rectangular segments");
+    };
+    let (body_alpha, inner_alpha, outer_alpha, spread) = match state {
+        SegmentState::Inactive => (0.035, 0.0, 0.0, 0.0),
+        SegmentState::Center => (0.34, 0.07, 0.025, 2.0),
+        SegmentState::Active => (0.88, 0.15, 0.045, 4.0),
+        SegmentState::Edge => (1.0, 0.22, 0.075, 5.0),
+    };
+    let active = matches!(state, SegmentState::Active | SegmentState::Edge);
+    let hot = hot_face(color, 0.76);
+
+    if outer_alpha > 0.0 {
+        fallback_emission_shapes.push(Shape::rect_filled(
+            rect.expand(spread),
+            rounding + 2.0,
+            with_opacity(color, opacity * outer_alpha),
+        ));
+        fallback_emission_shapes.push(Shape::rect_filled(
+            rect.expand(spread * 0.42),
+            rounding + 1.0,
+            with_opacity(color, opacity * inner_alpha),
+        ));
+    }
+    sharp_shapes.push(Shape::rect_filled(
+        rect,
+        rounding,
+        with_opacity(color, opacity * body_alpha),
+    ));
+    if active {
+        let intensity = if state == SegmentState::Edge {
+            0.38
+        } else {
+            0.26
+        };
+        glow.rounded_rect(rect, 7.0, color, opacity * intensity);
+
+        let highlight_y = rect.min.y + (rect.height() * 0.25).max(0.7);
+        sharp_shapes.push(Shape::line_segment(
+            [
+                Pos2::new(rect.min.x + 1.0, highlight_y),
+                Pos2::new(rect.max.x - 1.0, highlight_y),
+            ],
+            Stroke::new(
+                0.8_f32,
+                with_opacity(
+                    hot,
+                    opacity
+                        * if state == SegmentState::Edge {
+                            0.92
+                        } else {
+                            0.68
+                        },
+                ),
+            ),
+        ));
+    }
+}
+
 fn push_luminous_segment(
     shapes: &mut Vec<Shape>,
     geometry: SegmentGeometry,
@@ -940,6 +1099,10 @@ fn hot_face(color: Color32, white_mix: f32) -> Color32 {
 fn draw_head(painter: &Painter, center: Pos2, color: Color32, opacity: f32) {
     painter.circle_filled(center, 15.0, with_opacity(color, opacity * 0.045));
     painter.circle_filled(center, 8.0, with_opacity(color, opacity * 0.15));
+    draw_head_core(painter, center, color, opacity);
+}
+
+fn draw_head_core(painter: &Painter, center: Pos2, color: Color32, opacity: f32) {
     painter.circle_filled(center, 4.2, with_opacity(color, opacity * 0.88));
     painter.circle_filled(center, 1.8, with_opacity(hot_face(color, 0.84), opacity));
 }
