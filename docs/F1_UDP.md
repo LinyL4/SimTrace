@@ -38,4 +38,10 @@ With the 2026 Season Pack sending native Format 2026, verify that:
 - opening and closing the Phase Plot does not interrupt collection;
 - restarting SimTrace retains the listen address, port, trace window, and display refresh rate.
 
+### Live diagnostic log
+
+On Windows, receive and decoder diagnostics are written to `%APPDATA%\simtrace\simtrace.log.YYYY-MM-DD`. The first few distinct packet headers include the sender, datagram length, format/year, game major/minor version, packet version, packet ID/type, and player-car index. A summary is emitted every five seconds while packets arrive, with counters for protocol detection, validation, telemetry/status decoding, normalized frames, and categorized rejections. Each rejection category logs at most its first three examples.
+
+For a failed live test, preserve the lines containing `F1 UDP datagram header observed`, `F1 UDP datagram rejected`, and `F1 UDP diagnostic summary`. These values should be compared with the current EA specification before any decoder layout is changed.
+
 F1 car status packets expose the configured ABS and traction-control assistance modes. They do not identify moment-by-moment intervention, so SimTrace does not invent ABS-active or TC-active samples. The initial decoder also leaves physical wheel angle and wheel slip unsupported until a later packet integration provides those channels correctly.

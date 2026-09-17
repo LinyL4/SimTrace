@@ -1,10 +1,91 @@
-use anyhow::{bail, Context, Result};
+use std::error::Error;
+use std::fmt;
+
+use anyhow::Result;
 
 use crate::core::{
     DriverAssistStatus, SourceMetadata, TelemetryCapabilities, TelemetryData, VehicleTelemetry,
 };
 
 pub const HEADER_LEN: usize = 29;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    HeaderLength,
+    HeaderField,
+    PacketFormat,
+    GameYear,
+    PacketVersion,
+    PacketLength,
+    PlayerIndex,
+    PayloadField,
+    InvalidValue,
+    Other,
+}
+
+impl RejectReason {
+    pub const ALL: [Self; 10] = [
+        Self::HeaderLength,
+        Self::HeaderField,
+        Self::PacketFormat,
+        Self::GameYear,
+        Self::PacketVersion,
+        Self::PacketLength,
+        Self::PlayerIndex,
+        Self::PayloadField,
+        Self::InvalidValue,
+        Self::Other,
+    ];
+    pub const COUNT: usize = Self::ALL.len();
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HeaderLength => "header_length",
+            Self::HeaderField => "header_field",
+            Self::PacketFormat => "packet_format",
+            Self::GameYear => "game_year",
+            Self::PacketVersion => "packet_version",
+            Self::PacketLength => "packet_length",
+            Self::PlayerIndex => "player_index",
+            Self::PayloadField => "payload_field",
+            Self::InvalidValue => "invalid_value",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DecodeRejection {
+    reason: RejectReason,
+    detail: String,
+}
+
+impl fmt::Display for DecodeRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl Error for DecodeRejection {}
+
+pub fn reject(reason: RejectReason, detail: impl Into<String>) -> anyhow::Error {
+    DecodeRejection {
+        reason,
+        detail: detail.into(),
+    }
+    .into()
+}
+
+pub fn reject_reason(error: &anyhow::Error) -> RejectReason {
+    error
+        .downcast_ref::<DecodeRejection>()
+        .map(|rejection| rejection.reason)
+        .unwrap_or(RejectReason::Other)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
@@ -61,7 +142,10 @@ impl DecoderState {
 
     pub fn set_assists(&mut self, tc: u8, abs: u8) -> Result<()> {
         if tc > 2 || abs > 1 {
-            bail!("invalid F1 assist status");
+            return Err(reject(
+                RejectReason::InvalidValue,
+                format!("invalid F1 assist status: TC={tc}, ABS={abs}"),
+            ));
         }
         self.assists = DriverAssistStatus {
             abs_enabled: Some(abs == 1),
@@ -84,7 +168,10 @@ impl DecoderState {
             return Ok(None);
         }
         if !fields.throttle.is_finite() || !fields.steer.is_finite() || !fields.brake.is_finite() {
-            bail!("non-finite F1 telemetry input");
+            return Err(reject(
+                RejectReason::InvalidValue,
+                "non-finite F1 telemetry input",
+            ));
         }
         let track_position = match (self.player_lap_distance_m, self.track_length_m) {
             (Some(distance), Some(length)) if length > 0.0 => {
@@ -142,7 +229,13 @@ impl DecoderState {
 }
 
 pub fn packet_format(bytes: &[u8]) -> Result<u16> {
-    read_u16(bytes, 0).context("F1 packet missing format identifier")
+    if bytes.len() < 2 {
+        return Err(reject(
+            RejectReason::HeaderField,
+            "F1 packet missing format identifier",
+        ));
+    }
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 /// Both current official specifications define this exact 29-byte header.
@@ -154,19 +247,34 @@ pub fn parse_header(
     max_cars: usize,
 ) -> Result<Header> {
     if bytes.len() < HEADER_LEN {
-        bail!("F1 packet shorter than header");
+        return Err(reject(
+            RejectReason::HeaderLength,
+            format!(
+                "F1 packet shorter than header: {}; expected at least {HEADER_LEN}",
+                bytes.len()
+            ),
+        ));
     }
     let format = packet_format(bytes)?;
     if format != expected_format {
-        bail!("wrong F1 UDP format {format}; expected {expected_format}");
+        return Err(reject(
+            RejectReason::PacketFormat,
+            format!("wrong F1 UDP format {format}; expected {expected_format}"),
+        ));
     }
     let game_year = bytes[2];
     if game_year != 0 && game_year != expected_game_year {
-        bail!("wrong F1 game year {game_year}; expected {expected_game_year}");
+        return Err(reject(
+            RejectReason::GameYear,
+            format!("wrong F1 game year {game_year}; expected {expected_game_year}"),
+        ));
     }
     let player_car_index = bytes[27] as usize;
     if player_car_index >= max_cars {
-        bail!("invalid F1 player car index {player_car_index}");
+        return Err(reject(
+            RejectReason::PlayerIndex,
+            format!("invalid F1 player car index {player_car_index}; car count is {max_cars}"),
+        ));
     }
     Ok(Header {
         packet_version: bytes[5],
@@ -181,13 +289,19 @@ pub fn parse_header(
 
 pub fn require_packet(bytes: &[u8], expected_len: usize, version: u8) -> Result<()> {
     if version != 1 {
-        bail!("unsupported F1 packet version {version}");
+        return Err(reject(
+            RejectReason::PacketVersion,
+            format!("unsupported F1 packet version {version}; expected 1"),
+        ));
     }
     if bytes.len() != expected_len {
-        bail!(
-            "wrong F1 packet length {}; expected {expected_len}",
-            bytes.len()
-        );
+        return Err(reject(
+            RejectReason::PacketLength,
+            format!(
+                "wrong F1 packet length {}; expected {expected_len}",
+                bytes.len()
+            ),
+        ));
     }
     Ok(())
 }
@@ -196,11 +310,14 @@ pub fn player_offset(index: usize, item_len: usize) -> Result<usize> {
     index
         .checked_mul(item_len)
         .and_then(|offset| HEADER_LEN.checked_add(offset))
-        .context("F1 player data offset overflow")
+        .ok_or_else(|| reject(RejectReason::PlayerIndex, "F1 player data offset overflow"))
 }
 
 pub fn read_u8(bytes: &[u8], offset: usize) -> Result<u8> {
-    bytes.get(offset).copied().context("truncated F1 u8")
+    bytes
+        .get(offset)
+        .copied()
+        .ok_or_else(|| reject(RejectReason::PayloadField, "truncated F1 u8"))
 }
 
 pub fn read_i8(bytes: &[u8], offset: usize) -> Result<i8> {
@@ -208,37 +325,31 @@ pub fn read_i8(bytes: &[u8], offset: usize) -> Result<i8> {
 }
 
 pub fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    Ok(u16::from_le_bytes(
-        bytes
-            .get(offset..offset + 2)
-            .context("truncated F1 u16")?
-            .try_into()?,
-    ))
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| reject(RejectReason::PayloadField, "truncated F1 u16"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
 }
 
 pub fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(
-        bytes
-            .get(offset..offset + 4)
-            .context("truncated F1 u32")?
-            .try_into()?,
-    ))
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| reject(RejectReason::PayloadField, "truncated F1 u32"))?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 pub fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
-    Ok(u64::from_le_bytes(
-        bytes
-            .get(offset..offset + 8)
-            .context("truncated F1 u64")?
-            .try_into()?,
-    ))
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| reject(RejectReason::PayloadField, "truncated F1 u64"))?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
 }
 
 pub fn read_f32(bytes: &[u8], offset: usize) -> Result<f32> {
-    Ok(f32::from_le_bytes(
-        bytes
-            .get(offset..offset + 4)
-            .context("truncated F1 f32")?
-            .try_into()?,
-    ))
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| reject(RejectReason::PayloadField, "truncated F1 f32"))?;
+    Ok(f32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }

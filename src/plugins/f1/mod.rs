@@ -3,6 +3,7 @@
 //! The socket transport is shared. Packet identity selects a protocol-specific
 //! decoder before any packet layout is interpreted.
 
+mod diagnostics;
 mod f1_2025;
 mod f1_2026;
 mod protocol;
@@ -10,7 +11,7 @@ mod protocol;
 use std::io::ErrorKind;
 use std::net::UdpSocket;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tracing::{debug, info};
 
 use crate::core::TelemetryData;
@@ -29,7 +30,10 @@ impl ProtocolRouter {
         match protocol::packet_format(bytes)? {
             f1_2025::PACKET_FORMAT => self.f1_2025.decode(bytes),
             f1_2026::PACKET_FORMAT => self.f1_2026.decode(bytes),
-            format => bail!("unsupported F1 UDP format {format}"),
+            format => Err(protocol::reject(
+                protocol::RejectReason::PacketFormat,
+                format!("unsupported F1 UDP format {format}"),
+            )),
         }
     }
 }
@@ -39,6 +43,7 @@ pub struct F1Plugin {
     port: u16,
     socket: Option<UdpSocket>,
     router: ProtocolRouter,
+    diagnostics: diagnostics::Diagnostics,
 }
 
 impl F1Plugin {
@@ -48,6 +53,7 @@ impl F1Plugin {
             port: config.f1_udp_port,
             socket: None,
             router: ProtocolRouter::default(),
+            diagnostics: diagnostics::Diagnostics::default(),
         }
     }
 }
@@ -67,13 +73,20 @@ impl GamePlugin for F1Plugin {
             })?;
         socket.set_nonblocking(true)?;
         info!(address = %self.bind_address, port = self.port, "F1 UDP listener ready");
+        info!(
+            distinct_header_limit = 12,
+            summary_interval_seconds = 5,
+            "F1 UDP live diagnostics active; awaiting datagrams"
+        );
         self.socket = Some(socket);
         Ok(())
     }
 
     fn disconnect(&mut self) {
+        self.diagnostics.log_summary("disconnect");
         self.socket = None;
         self.router = ProtocolRouter::default();
+        self.diagnostics = diagnostics::Diagnostics::default();
     }
 
     fn is_connected(&self) -> bool {
@@ -95,13 +108,18 @@ impl GamePlugin for F1Plugin {
                 break;
             }
             match socket.recv_from(&mut datagram) {
-                Ok((len, _source)) => match self.router.decode(&datagram[..len]) {
-                    Ok(Some(sample)) => samples.push(sample),
-                    Ok(None) => {}
-                    Err(error) => {
-                        debug!(%error, packet_len = len, "discarded invalid F1 UDP packet")
+                Ok((len, source)) => {
+                    let header = self.diagnostics.observe_datagram(&datagram[..len], source);
+                    let result = self.router.decode(&datagram[..len]);
+                    self.diagnostics.observe_result(header, &result);
+                    match result {
+                        Ok(Some(sample)) => samples.push(sample),
+                        Ok(None) => {}
+                        Err(error) => {
+                            debug!(%error, packet_len = len, "discarded invalid F1 UDP packet")
+                        }
                     }
-                },
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.into()),
             }
