@@ -3,14 +3,14 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::protocol::{self, RejectReason, HEADER_LEN};
 use crate::core::TelemetryData;
 
 const DISTINCT_HEADER_LOG_LIMIT: usize = 12;
 const REJECTION_LOG_LIMIT_PER_REASON: u64 = 3;
-const SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HeaderPreview {
@@ -60,6 +60,7 @@ pub struct Diagnostics {
     distinct_headers: HashSet<HeaderPreview>,
     last_summary_at: Instant,
     last_summary_received: u64,
+    last_summary_normalized: u64,
 }
 
 impl Default for Diagnostics {
@@ -82,6 +83,7 @@ impl Default for Diagnostics {
             distinct_headers: HashSet::new(),
             last_summary_at: Instant::now(),
             last_summary_received: 0,
+            last_summary_normalized: 0,
         }
     }
 }
@@ -103,7 +105,7 @@ impl Diagnostics {
         if self.distinct_headers.len() < DISTINCT_HEADER_LOG_LIMIT
             && self.distinct_headers.insert(header)
         {
-            info!(
+            debug!(
                 sender = %source,
                 packet_len = header.packet_len,
                 format = header.packet_format,
@@ -148,7 +150,7 @@ impl Diagnostics {
                 if let Some(sample) = sample {
                     self.normalized_frames += 1;
                     if self.normalized_frames <= 3 {
-                        info!(
+                        debug!(
                             format = sample.source.protocol_format,
                             frame = sample.source.frame_identifier,
                             overall_frame = sample.source.overall_frame_identifier,
@@ -228,9 +230,23 @@ impl Diagnostics {
         if self.last_summary_at.elapsed() >= SUMMARY_INTERVAL
             && self.datagrams_received != self.last_summary_received
         {
-            self.log_summary("periodic");
+            let elapsed_seconds = self.last_summary_at.elapsed().as_secs_f64();
+            let datagram_delta = self.datagrams_received - self.last_summary_received;
+            let normalized_delta = self.normalized_frames - self.last_summary_normalized;
+            info!(
+                interval_seconds = elapsed_seconds,
+                datagram_rate_hz = datagram_delta as f64 / elapsed_seconds,
+                normalized_rate_hz = normalized_delta as f64 / elapsed_seconds,
+                datagrams_received = self.datagrams_received,
+                telemetry_decoded = self.telemetry_decoded,
+                status_decoded = self.status_decoded,
+                normalized_frames = self.normalized_frames,
+                stale_telemetry_frames = self.stale_telemetry_frames,
+                "F1 runtime counters"
+            );
             self.last_summary_at = Instant::now();
             self.last_summary_received = self.datagrams_received;
+            self.last_summary_normalized = self.normalized_frames;
         }
     }
 }

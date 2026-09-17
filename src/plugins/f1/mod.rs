@@ -75,7 +75,7 @@ impl GamePlugin for F1Plugin {
         info!(address = %self.bind_address, port = self.port, "F1 UDP listener ready");
         info!(
             distinct_header_limit = 12,
-            summary_interval_seconds = 5,
+            summary_interval_seconds = 30,
             "F1 UDP live diagnostics active; awaiting datagrams"
         );
         self.socket = Some(socket);

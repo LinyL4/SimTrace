@@ -19,6 +19,7 @@ const MIN_HEIGHT: f32 = 130.0;
 /// Track position strip height and gap below the main content.
 const STRIP_H: f32 = 10.0;
 const STRIP_GAP: f32 = 3.0;
+const RUNTIME_COUNTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ── Background poller ─────────────────────────────────────────────────────────
 
@@ -64,6 +65,8 @@ pub struct SimTraceApp {
     analysis: Arc<Mutex<LapStore>>,
     active_provider_config: ProviderConfig,
     last_update_at: std::time::Instant,
+    runtime_counter_started_at: std::time::Instant,
+    ui_updates_since_report: u64,
 }
 
 impl SimTraceApp {
@@ -99,6 +102,8 @@ impl SimTraceApp {
             analysis: Arc::new(Mutex::new(LapStore::new())),
             active_provider_config: provider_config,
             last_update_at: std::time::Instant::now(),
+            runtime_counter_started_at: std::time::Instant::now(),
+            ui_updates_since_report: 0,
         }
     }
 
@@ -169,6 +174,7 @@ impl eframe::App for SimTraceApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = std::time::Instant::now();
+        self.ui_updates_since_report += 1;
         let frame_dt = now
             .duration_since(self.last_update_at)
             .as_secs_f32()
@@ -672,6 +678,25 @@ impl eframe::App for SimTraceApp {
             }
         }
         ctx.request_repaint_after(render_interval(&self.settings));
+
+        let counter_elapsed = self.runtime_counter_started_at.elapsed();
+        if counter_elapsed >= RUNTIME_COUNTER_INTERVAL {
+            let elapsed_seconds = counter_elapsed.as_secs_f64();
+            tracing::info!(
+                interval_seconds = elapsed_seconds,
+                ui_update_rate_hz = self.ui_updates_since_report as f64 / elapsed_seconds,
+                configured_ui_fps = self.settings.graph.validated_ui_fps(),
+                window_seconds = self.settings.graph.window_seconds,
+                phase_plot_open = self.settings.graph.phase_plot_open,
+                history_samples = self.buffer.len(),
+                current_lap_samples = analysis_snapshot.sample_count(),
+                reference_lap_samples =
+                    analysis_snapshot.reference_lap.as_ref().map_or(0, Vec::len),
+                "SimTrace runtime counters"
+            );
+            self.runtime_counter_started_at = std::time::Instant::now();
+            self.ui_updates_since_report = 0;
+        }
     }
 }
 
