@@ -16,21 +16,61 @@ const DISPLAY_FONT_NAME: &str = "saira_semi_condensed_semibold";
 const GRID_DIVISIONS: usize = 4;
 const HISTORY_BANDS: usize = 8;
 const RPM_SEGMENTS: usize = 15;
-const PEDAL_SEGMENTS: usize = 12;
-const STEERING_SEGMENTS_PER_SIDE: usize = 12;
-const STEERING_ARC_DEGREES: f32 = 240.0;
+const PEDAL_SEGMENTS: usize = 15;
+const STEERING_SEGMENTS_PER_SIDE: usize = 18;
+const STEERING_ARC_DEGREES: f32 = 150.0;
 const F1_SPEED_SCALE_MS: f32 = 100.0;
 
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(244, 247, 250);
 const TEXT_SECONDARY: Color32 = Color32::from_rgb(166, 178, 193);
 const GRID_COLOR: Color32 = Color32::from_rgb(112, 132, 153);
-const BRAKE_COLOR: Color32 = Color32::from_rgb(255, 91, 96);
-const THROTTLE_COLOR: Color32 = Color32::from_rgb(74, 234, 158);
-const SPEED_COLOR: Color32 = Color32::from_rgb(126, 196, 225);
 const STEERING_COLOR: Color32 = Color32::from_rgb(238, 245, 250);
-const RPM_LOW: Color32 = Color32::from_rgb(74, 167, 235);
-const RPM_HIGH: Color32 = Color32::from_rgb(255, 78, 99);
 const ABS_COLOR: Color32 = Color32::from_rgb(255, 194, 55);
+
+#[derive(Clone, Copy)]
+struct ChannelPalette {
+    emission: Color32,
+    body: Color32,
+    hot: Color32,
+    text_face: Color32,
+    text_glow: Color32,
+}
+
+const BRAKE: ChannelPalette = ChannelPalette {
+    emission: Color32::from_rgb(255, 45, 52),
+    body: Color32::from_rgb(255, 67, 72),
+    hot: Color32::from_rgb(255, 184, 170),
+    text_face: Color32::from_rgb(255, 86, 89),
+    text_glow: Color32::from_rgb(255, 48, 56),
+};
+const THROTTLE: ChannelPalette = ChannelPalette {
+    emission: Color32::from_rgb(0, 255, 85),
+    body: Color32::from_rgb(30, 255, 106),
+    hot: Color32::from_rgb(185, 255, 211),
+    text_face: Color32::from_rgb(66, 244, 130),
+    text_glow: Color32::from_rgb(0, 238, 99),
+};
+const SPEED: ChannelPalette = ChannelPalette {
+    emission: Color32::from_rgb(0, 166, 255),
+    body: Color32::from_rgb(40, 190, 255),
+    hot: Color32::from_rgb(194, 241, 255),
+    text_face: Color32::from_rgb(95, 190, 242),
+    text_glow: Color32::from_rgb(0, 166, 255),
+};
+const RPM_LOW: ChannelPalette = ChannelPalette {
+    emission: Color32::from_rgb(43, 151, 239),
+    body: Color32::from_rgb(67, 170, 241),
+    hot: Color32::from_rgb(171, 221, 255),
+    text_face: Color32::from_rgb(67, 170, 241),
+    text_glow: Color32::from_rgb(43, 151, 239),
+};
+const RPM_HIGH: ChannelPalette = ChannelPalette {
+    emission: Color32::from_rgb(255, 45, 70),
+    body: Color32::from_rgb(255, 66, 87),
+    hot: Color32::from_rgb(255, 178, 180),
+    text_face: Color32::from_rgb(255, 66, 87),
+    text_glow: Color32::from_rgb(255, 45, 70),
+};
 
 /// Install the single bundled display face without changing the font used by
 /// Classic or by settings widgets.
@@ -216,7 +256,7 @@ impl<'a> F1OpenHud<'a> {
         if capabilities.is_some_and(|value| value.brake) {
             self.build_trace_layers(
                 brake_bands,
-                BRAKE_COLOR,
+                BRAKE,
                 true,
                 true,
                 &mut cache.sharp_shapes,
@@ -227,7 +267,7 @@ impl<'a> F1OpenHud<'a> {
         if capabilities.is_some_and(|value| value.throttle) {
             self.build_trace_layers(
                 throttle_bands,
-                THROTTLE_COLOR,
+                THROTTLE,
                 true,
                 true,
                 &mut cache.sharp_shapes,
@@ -238,7 +278,7 @@ impl<'a> F1OpenHud<'a> {
         if capabilities.is_some_and(|value| value.speed) {
             self.build_trace_layers(
                 speed_bands,
-                SPEED_COLOR,
+                SPEED,
                 false,
                 false,
                 &mut cache.sharp_shapes,
@@ -247,30 +287,23 @@ impl<'a> F1OpenHud<'a> {
             );
         }
 
-        for (head, color) in [
-            (cache.brake_head, BRAKE_COLOR),
-            (cache.throttle_head, THROTTLE_COLOR),
-        ] {
+        for (head, palette) in [(cache.brake_head, BRAKE), (cache.throttle_head, THROTTLE)] {
             if let Some(head) = head {
-                glow.radial(head, 15.0, color, self.opacity * 0.34);
+                glow.radial(head, 15.0, palette.emission, self.opacity * 0.34);
             }
         }
 
         self.build_pedal_meter(
             layout.brake_meter_rect,
             cache.values.brake_level,
-            BRAKE_COLOR,
+            BRAKE,
             &mut cache.sharp_shapes,
-            &mut cache.fallback_emission_shapes,
-            &mut glow,
         );
         self.build_pedal_meter(
             layout.throttle_meter_rect,
             cache.values.throttle_level,
-            THROTTLE_COLOR,
+            THROTTLE,
             &mut cache.sharp_shapes,
-            &mut cache.fallback_emission_shapes,
-            &mut glow,
         );
         self.build_steering_arc(
             layout.steering_rect,
@@ -285,13 +318,27 @@ impl<'a> F1OpenHud<'a> {
             &mut cache.fallback_emission_shapes,
             &mut glow,
         );
+        // A low-energy radial emitter gives the speed readout a continuous halo
+        // without stacking offset glyph copies around its edges.
+        glow.radial(
+            gear_value_position(&layout),
+            44.0,
+            STEERING_COLOR,
+            self.opacity * 0.11,
+        );
+        glow.radial(
+            speed_value_position(&layout),
+            34.0,
+            STEERING_COLOR,
+            self.opacity * 0.10,
+        );
         cache.glow_batch = glow.finish(cache.generation);
     }
 
     fn build_trace_layers(
         &self,
         bands: [Vec<Pos2>; HISTORY_BANDS],
-        color: Color32,
+        palette: ChannelPalette,
         primary: bool,
         additive_emission: bool,
         sharp_shapes: &mut Vec<Shape>,
@@ -304,7 +351,6 @@ impl<'a> F1OpenHud<'a> {
             }
             let recency = (band + 1) as f32 / HISTORY_BANDS as f32;
             let energy = (0.08 + 0.92 * recency.powf(1.6)) * self.opacity;
-            let hot = hot_face(color, if primary { 0.76 } else { 0.48 });
             let (
                 outer_width,
                 outer_alpha,
@@ -326,24 +372,36 @@ impl<'a> F1OpenHud<'a> {
             };
             emission_shapes.push(Shape::line(
                 points.clone(),
-                Stroke::new(outer_width, with_opacity(color, energy * outer_alpha)),
+                Stroke::new(
+                    outer_width,
+                    with_opacity(palette.emission, energy * outer_alpha),
+                ),
             ));
             emission_shapes.push(Shape::line(
                 points.clone(),
-                Stroke::new(inner_width, with_opacity(color, energy * inner_alpha)),
+                Stroke::new(
+                    inner_width,
+                    with_opacity(palette.emission, energy * inner_alpha),
+                ),
             ));
             if additive_emission {
                 for segment in points.windows(2) {
-                    glow.ribbon_segment(segment[0], segment[1], 7.5, color, energy * 0.30);
+                    glow.ribbon_segment(
+                        segment[0],
+                        segment[1],
+                        7.5,
+                        palette.emission,
+                        energy * 0.30,
+                    );
                 }
             }
             sharp_shapes.push(Shape::line(
                 points.clone(),
-                Stroke::new(body_width, with_opacity(color, energy * body_alpha)),
+                Stroke::new(body_width, with_opacity(palette.body, energy * body_alpha)),
             ));
             sharp_shapes.push(Shape::line(
                 points,
-                Stroke::new(core_width, with_opacity(hot, energy * core_alpha)),
+                Stroke::new(core_width, with_opacity(palette.hot, energy * core_alpha)),
             ));
         }
     }
@@ -375,17 +433,13 @@ impl<'a> F1OpenHud<'a> {
         &self,
         rect: Rect,
         level: Option<f32>,
-        color: Color32,
+        palette: ChannelPalette,
         sharp_shapes: &mut Vec<Shape>,
-        fallback_emission_shapes: &mut Vec<Shape>,
-        glow: &mut GlowBatchBuilder,
     ) {
         let Some(level) = level else {
             return;
         };
-        let gap = (rect.height() * 0.018).clamp(1.5, 3.0);
-        let segment_height =
-            ((rect.height() - gap * (PEDAL_SEGMENTS - 1) as f32) / PEDAL_SEGMENTS as f32).max(2.0);
+        let (gap, segment_height) = pedal_segment_geometry(rect.height());
         let active_count = (level.clamp(0.0, 1.0) * PEDAL_SEGMENTS as f32).ceil() as usize;
 
         for index in 0..PEDAL_SEGMENTS {
@@ -394,22 +448,12 @@ impl<'a> F1OpenHud<'a> {
                 Pos2::new(rect.min.x, y),
                 Vec2::new(rect.width(), segment_height),
             );
-            let state = if index + 1 == active_count && active_count > 0 {
-                SegmentState::Edge
-            } else if index < active_count {
-                SegmentState::Active
+            let color = if index < active_count {
+                with_opacity(palette.body, self.opacity * 0.92)
             } else {
-                SegmentState::Inactive
+                with_opacity(Color32::from_rgb(128, 132, 148), self.opacity * 0.28)
             };
-            push_additive_segment(
-                sharp_shapes,
-                fallback_emission_shapes,
-                glow,
-                SegmentGeometry::Rect(segment, 1.2),
-                color,
-                state,
-                self.opacity,
-            );
+            sharp_shapes.push(Shape::rect_filled(segment, 1.0, color));
         }
     }
 
@@ -420,14 +464,14 @@ impl<'a> F1OpenHud<'a> {
         let side = STEERING_SEGMENTS_PER_SIDE;
         let segment_count = side * 2 + 1;
         let center_index = side;
-        let center = Pos2::new(rect.center().x, rect.center().y + rect.height() * 0.12);
-        let outer_radius = (rect.width().min(rect.height()) * 0.48).max(8.0);
-        let inner_radius = (outer_radius - (outer_radius * 0.13).clamp(3.5, 6.0)).max(2.0);
+        let center = Pos2::new(rect.center().x, rect.min.y + rect.height() * 0.70);
+        let outer_radius = (rect.width() * 0.49).max(8.0);
+        let inner_radius = (outer_radius - (outer_radius * 0.16).clamp(7.0, 12.0)).max(2.0);
         let total_arc = STEERING_ARC_DEGREES.to_radians();
         let center_angle = -std::f32::consts::FRAC_PI_2;
         let start = center_angle - total_arc * 0.5;
         let step = total_arc / segment_count as f32;
-        let gap = step * 0.28;
+        let gap = step * 0.60;
         let active_count = (steering.abs().clamp(0.0, 1.0) * side as f32).ceil() as usize;
         let edge_index = if steering < 0.0 && active_count > 0 {
             Some(center_index - active_count)
@@ -483,7 +527,7 @@ impl<'a> F1OpenHud<'a> {
         let Some(rev_lights) = rev_lights else {
             return;
         };
-        let gap = 3.0_f32;
+        let gap = 4.0_f32;
         let width = (rect.width() - gap * (RPM_SEGMENTS - 1) as f32) / RPM_SEGMENTS as f32;
         let y = rect.min.y + rect.height() * 0.16;
 
@@ -492,9 +536,9 @@ impl<'a> F1OpenHud<'a> {
             .find(|index| rev_lights.bit_value & (1_u16 << index) != 0);
         for index in 0..RPM_SEGMENTS {
             let x = rect.min.x + index as f32 * (width + gap);
-            let segment = Rect::from_min_size(Pos2::new(x, y), Vec2::new(width.max(1.0), 4.5));
+            let segment = Rect::from_min_size(Pos2::new(x, y), Vec2::new(width.max(1.0), 5.5));
             let active = rev_lights.bit_value & (1_u16 << index) != 0;
-            let base = if index < 10 { RPM_LOW } else { RPM_HIGH };
+            let palette = if index < 10 { RPM_LOW } else { RPM_HIGH };
             let state = if active_edge == Some(index) {
                 SegmentState::Edge
             } else if active {
@@ -507,7 +551,9 @@ impl<'a> F1OpenHud<'a> {
                 fallback_emission_shapes,
                 glow,
                 SegmentGeometry::Rect(segment, 0.9),
-                base,
+                palette.emission,
+                palette.body,
+                palette.hot,
                 state,
                 self.opacity,
             );
@@ -591,27 +637,27 @@ impl<'a> F1OpenHud<'a> {
         let label_top = layout.trace_rect.min.y + 13.0;
         let label_step = 24.0;
 
-        for (head, color, strength, migrated) in [
-            (cache.brake_head, BRAKE_COLOR, 1.0, true),
-            (cache.throttle_head, THROTTLE_COLOR, 1.0, true),
-            (cache.speed_head, SPEED_COLOR, 0.68, false),
+        for (head, palette, strength, migrated) in [
+            (cache.brake_head, BRAKE, 1.0, true),
+            (cache.throttle_head, THROTTLE, 1.0, true),
+            (cache.speed_head, SPEED, 0.68, false),
         ] {
             if let Some(head) = head {
                 if additive_glow_active && migrated {
-                    draw_head_core(painter, head, color, alpha * strength);
+                    draw_head_core(painter, head, palette, alpha * strength);
                 } else {
-                    draw_head(painter, head, color, alpha * strength);
+                    draw_head(painter, head, palette, alpha * strength);
                 }
             }
         }
 
         let channels = [
-            ("BRAKE", &cache.values.brake, BRAKE_COLOR),
-            ("THROTTLE", &cache.values.throttle, THROTTLE_COLOR),
-            ("SPEED", &cache.values.speed, SPEED_COLOR),
+            ("BRAKE", &cache.values.brake, BRAKE),
+            ("THROTTLE", &cache.values.throttle, THROTTLE),
+            ("SPEED", &cache.values.speed, SPEED),
         ];
 
-        for (index, (label, value, color)) in channels.into_iter().enumerate() {
+        for (index, (label, value, palette)) in channels.into_iter().enumerate() {
             let y = label_top + index as f32 * label_step;
             luminous_text(
                 painter,
@@ -619,9 +665,9 @@ impl<'a> F1OpenHud<'a> {
                 Align2::LEFT_CENTER,
                 label,
                 label_font.clone(),
-                color,
-                color,
-                alpha * if index == 2 { 0.76 } else { 0.94 },
+                palette.text_face,
+                palette.text_glow,
+                alpha * 0.98,
                 TextClass::Channel,
             );
             luminous_text(
@@ -630,9 +676,9 @@ impl<'a> F1OpenHud<'a> {
                 Align2::RIGHT_CENTER,
                 value,
                 value_font.clone(),
-                color,
-                color,
-                alpha * if index == 2 { 0.78 } else { 1.0 },
+                palette.text_face,
+                palette.text_glow,
+                alpha,
                 TextClass::Channel,
             );
         }
@@ -661,18 +707,13 @@ impl<'a> F1OpenHud<'a> {
             );
         }
 
-        for (meter, value, label, color) in [
-            (
-                layout.brake_meter_rect,
-                &cache.values.brake,
-                "BRAKE",
-                BRAKE_COLOR,
-            ),
+        for (meter, value, label, palette) in [
+            (layout.brake_meter_rect, &cache.values.brake, "BRAKE", BRAKE),
             (
                 layout.throttle_meter_rect,
                 &cache.values.throttle,
                 "THROTTLE",
-                THROTTLE_COLOR,
+                THROTTLE,
             ),
         ] {
             luminous_text(
@@ -681,8 +722,8 @@ impl<'a> F1OpenHud<'a> {
                 Align2::CENTER_BOTTOM,
                 value,
                 display_font(13.0),
-                color,
-                color,
+                palette.text_face,
+                palette.text_glow,
                 alpha,
                 TextClass::Channel,
             );
@@ -692,8 +733,8 @@ impl<'a> F1OpenHud<'a> {
                 Align2::CENTER_TOP,
                 label,
                 display_font(8.5),
-                color,
-                color,
+                palette.text_face,
+                palette.text_glow,
                 alpha * 0.78,
                 TextClass::Channel,
             );
@@ -701,10 +742,7 @@ impl<'a> F1OpenHud<'a> {
 
         luminous_text(
             painter,
-            Pos2::new(
-                layout.steering_rect.center().x,
-                layout.steering_rect.center().y + layout.steering_rect.height() * 0.14,
-            ),
+            steering_value_position(&layout),
             Align2::CENTER_CENTER,
             &cache.values.steering,
             display_font(15.0),
@@ -715,11 +753,8 @@ impl<'a> F1OpenHud<'a> {
         );
         luminous_text(
             painter,
-            Pos2::new(
-                layout.steering_rect.center().x,
-                layout.steering_rect.max.y - 2.0,
-            ),
-            Align2::CENTER_BOTTOM,
+            steering_label_position(&layout),
+            Align2::CENTER_CENTER,
             "STEERING",
             display_font(8.0),
             TEXT_SECONDARY,
@@ -745,31 +780,25 @@ impl<'a> F1OpenHud<'a> {
         );
         luminous_text(
             painter,
-            Pos2::new(
-                center.x,
-                layout.center_rect.min.y + layout.center_rect.height() * 0.49,
-            ),
+            gear_value_position(&layout),
             Align2::CENTER_CENTER,
             &cache.values.gear,
             display_font((layout.center_rect.height() * 0.29).clamp(50.0, 94.0)),
             TEXT_PRIMARY,
             STEERING_COLOR,
             alpha,
-            TextClass::Major,
+            TextClass::Secondary,
         );
         luminous_text(
             painter,
-            Pos2::new(
-                center.x,
-                layout.center_rect.min.y + layout.center_rect.height() * 0.72,
-            ),
+            speed_value_position(&layout),
             Align2::CENTER_CENTER,
             &cache.values.speed,
             display_font((layout.center_rect.height() * 0.14).clamp(27.0, 48.0)),
             TEXT_PRIMARY,
             STEERING_COLOR,
             alpha * 0.94,
-            TextClass::Major,
+            TextClass::Secondary,
         );
         luminous_text(
             painter,
@@ -807,8 +836,8 @@ impl<'a> F1OpenHud<'a> {
                 Align2::CENTER_CENTER,
                 "TC",
                 display_font(10.5),
-                THROTTLE_COLOR,
-                THROTTLE_COLOR,
+                THROTTLE.text_face,
+                THROTTLE.text_glow,
                 alpha,
                 TextClass::Channel,
             );
@@ -883,9 +912,45 @@ impl OpenHudLayout {
     }
 }
 
+fn speed_value_position(layout: &OpenHudLayout) -> Pos2 {
+    Pos2::new(
+        layout.center_rect.center().x,
+        layout.center_rect.min.y + layout.center_rect.height() * 0.72,
+    )
+}
+
+fn gear_value_position(layout: &OpenHudLayout) -> Pos2 {
+    Pos2::new(
+        layout.center_rect.center().x,
+        layout.center_rect.min.y + layout.center_rect.height() * 0.49,
+    )
+}
+
+fn steering_value_position(layout: &OpenHudLayout) -> Pos2 {
+    Pos2::new(
+        layout.steering_rect.center().x,
+        layout.steering_rect.min.y + layout.steering_rect.height() * 0.70,
+    )
+}
+
+fn steering_label_position(layout: &OpenHudLayout) -> Pos2 {
+    let value = steering_value_position(layout);
+    Pos2::new(
+        value.x,
+        (value.y + 23.0).min(layout.steering_rect.max.y - 4.0),
+    )
+}
+
 fn pedal_y(rect: Rect, value: f32) -> f32 {
     let pad = rect.height() * 0.06;
     rect.max.y - pad - value.clamp(0.0, 1.0) * (rect.height() - 2.0 * pad)
+}
+
+fn pedal_segment_geometry(total_height: f32) -> (f32, f32) {
+    let gap = (total_height * 0.030).clamp(2.0, 4.0);
+    let segment_height =
+        ((total_height - gap * (PEDAL_SEGMENTS - 1) as f32) / PEDAL_SEGMENTS as f32).max(1.0);
+    (gap, segment_height)
 }
 
 fn speed_y(rect: Rect, speed_ms: f32) -> f32 {
@@ -910,7 +975,9 @@ fn push_additive_segment(
     fallback_emission_shapes: &mut Vec<Shape>,
     glow: &mut GlowBatchBuilder,
     geometry: SegmentGeometry,
-    color: Color32,
+    emission_color: Color32,
+    body_color: Color32,
+    _hot_color: Color32,
     state: SegmentState,
     opacity: f32,
 ) {
@@ -918,30 +985,35 @@ fn push_additive_segment(
         unreachable!("the additive proof-of-concept only migrates rectangular segments");
     };
     let (body_alpha, inner_alpha, outer_alpha, spread) = match state {
-        SegmentState::Inactive => (0.035, 0.0, 0.0, 0.0),
-        SegmentState::Center => (0.34, 0.07, 0.025, 2.0),
+        SegmentState::Inactive => (0.30, 0.0, 0.0, 0.0),
+        SegmentState::Center => (0.95, 0.10, 0.035, 2.0),
         SegmentState::Active => (0.88, 0.15, 0.045, 4.0),
         SegmentState::Edge => (1.0, 0.22, 0.075, 5.0),
     };
     let active = matches!(state, SegmentState::Active | SegmentState::Edge);
-    let hot = hot_face(color, 0.76);
-
     if outer_alpha > 0.0 {
         fallback_emission_shapes.push(Shape::rect_filled(
             rect.expand(spread),
             rounding + 2.0,
-            with_opacity(color, opacity * outer_alpha),
+            with_opacity(emission_color, opacity * outer_alpha),
         ));
         fallback_emission_shapes.push(Shape::rect_filled(
             rect.expand(spread * 0.42),
             rounding + 1.0,
-            with_opacity(color, opacity * inner_alpha),
+            with_opacity(emission_color, opacity * inner_alpha),
         ));
     }
     sharp_shapes.push(Shape::rect_filled(
         rect,
         rounding,
-        with_opacity(color, opacity * body_alpha),
+        with_opacity(
+            if active {
+                body_color
+            } else {
+                Color32::from_rgb(128, 132, 148)
+            },
+            opacity * body_alpha,
+        ),
     ));
     if active {
         let intensity = if state == SegmentState::Edge {
@@ -949,26 +1021,13 @@ fn push_additive_segment(
         } else {
             0.26
         };
-        glow.rounded_rect(rect, 7.0, color, opacity * intensity);
+        glow.rounded_rect(rect, 3.5, emission_color, opacity * intensity * 1.5);
 
-        let highlight_y = rect.min.y + (rect.height() * 0.25).max(0.7);
-        sharp_shapes.push(Shape::line_segment(
-            [
-                Pos2::new(rect.min.x + 1.0, highlight_y),
-                Pos2::new(rect.max.x - 1.0, highlight_y),
-            ],
-            Stroke::new(
-                0.8_f32,
-                with_opacity(
-                    hot,
-                    opacity
-                        * if state == SegmentState::Edge {
-                            0.92
-                        } else {
-                            0.68
-                        },
-                ),
-            ),
+        // Uniform LED face without a directional bevel highlight.
+        sharp_shapes.push(Shape::rect_filled(
+            rect.shrink(0.15),
+            rounding,
+            with_opacity(hot_face(body_color, 0.46), opacity * 0.92),
         ));
     }
 }
@@ -981,8 +1040,8 @@ fn push_luminous_segment(
     opacity: f32,
 ) {
     let (body_alpha, inner_alpha, outer_alpha, spread) = match state {
-        SegmentState::Inactive => (0.035, 0.0, 0.0, 0.0),
-        SegmentState::Center => (0.34, 0.07, 0.025, 2.0),
+        SegmentState::Inactive => (0.10, 0.0, 0.0, 0.0),
+        SegmentState::Center => (0.95, 0.10, 0.035, 2.0),
         SegmentState::Active => (0.88, 0.15, 0.045, 4.0),
         SegmentState::Edge => (1.0, 0.22, 0.075, 5.0),
     };
@@ -1096,21 +1155,24 @@ fn hot_face(color: Color32, white_mix: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(heat(r) as u8, heat(g) as u8, heat(b) as u8, a)
 }
 
-fn draw_head(painter: &Painter, center: Pos2, color: Color32, opacity: f32) {
-    painter.circle_filled(center, 15.0, with_opacity(color, opacity * 0.045));
-    painter.circle_filled(center, 8.0, with_opacity(color, opacity * 0.15));
-    draw_head_core(painter, center, color, opacity);
+fn draw_head(painter: &Painter, center: Pos2, palette: ChannelPalette, opacity: f32) {
+    painter.circle_filled(
+        center,
+        15.0,
+        with_opacity(palette.emission, opacity * 0.045),
+    );
+    painter.circle_filled(center, 8.0, with_opacity(palette.emission, opacity * 0.15));
+    draw_head_core(painter, center, palette, opacity);
 }
 
-fn draw_head_core(painter: &Painter, center: Pos2, color: Color32, opacity: f32) {
-    painter.circle_filled(center, 4.2, with_opacity(color, opacity * 0.88));
-    painter.circle_filled(center, 1.8, with_opacity(hot_face(color, 0.84), opacity));
+fn draw_head_core(painter: &Painter, center: Pos2, palette: ChannelPalette, opacity: f32) {
+    painter.circle_filled(center, 4.2, with_opacity(palette.body, opacity * 0.88));
+    painter.circle_filled(center, 1.8, with_opacity(palette.hot, opacity));
 }
 
 #[derive(Clone, Copy)]
 enum TextClass {
     Channel,
-    Major,
     Secondary,
 }
 
@@ -1132,23 +1194,16 @@ fn luminous_text(
         anchor,
         &text,
         font.clone(),
-        with_opacity(Color32::from_black_alpha(150), opacity * 0.42),
+        with_opacity(Color32::from_black_alpha(145), opacity * 0.30),
     );
 
     let (outer_spread, outer_alpha, inner_spread, inner_alpha, face_mix) = match class {
         TextClass::Channel => (
             (font.size * 0.20).clamp(2.4, 4.0),
-            0.065,
-            (font.size * 0.09).clamp(1.0, 2.0),
-            0.19,
-            0.64,
-        ),
-        TextClass::Major => (
-            (font.size * 0.055).clamp(2.0, 3.8),
             0.05,
-            (font.size * 0.024).clamp(0.9, 1.6),
-            0.09,
-            0.18,
+            (font.size * 0.09).clamp(1.0, 2.0),
+            0.14,
+            0.16,
         ),
         TextClass::Secondary => (0.0, 0.0, 0.0, 0.0, 0.0),
     };
@@ -1189,4 +1244,21 @@ fn luminous_text(
         font,
         with_opacity(hot_face(core_color, face_mix), opacity),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fifteen_pedal_segments_preserve_meter_height() {
+        let total_height = 180.0;
+        let (gap, segment_height) = pedal_segment_geometry(total_height);
+        let reconstructed =
+            segment_height * PEDAL_SEGMENTS as f32 + gap * (PEDAL_SEGMENTS - 1) as f32;
+
+        assert_eq!(PEDAL_SEGMENTS, 15);
+        assert!((reconstructed - total_height).abs() < 0.001);
+        assert!((2.0..=4.0).contains(&gap));
+    }
 }
