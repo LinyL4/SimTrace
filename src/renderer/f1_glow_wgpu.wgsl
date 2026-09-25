@@ -78,3 +78,47 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Premultiplied output is required by the transparent window surface.
     return vec4<f32>(input.color * alpha, alpha);
 }
+
+// ── Continuous polyline halo (mesh) ─────────────────────────────────────────
+//
+// Cross-section vertices carry the normalised lateral coordinate so the same
+// `exp(-3.5 d^2)` falloff is reproduced without per-segment caps or joins.
+
+struct MeshVertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) lateral_intensity: vec2<f32>,
+    @location(2) color: vec3<f32>,
+    @location(3) viewport: vec2<f32>,
+};
+
+struct MeshVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) lateral: f32,
+    @location(1) intensity: f32,
+    @location(2) color: vec3<f32>,
+};
+
+@vertex
+fn vs_mesh(input: MeshVertexInput) -> MeshVertexOutput {
+    let viewport_size = input.viewport;
+    var output: MeshVertexOutput;
+    output.clip_position = vec4<f32>(
+        input.position.x / viewport_size.x * 2.0 - 1.0,
+        1.0 - input.position.y / viewport_size.y * 2.0,
+        0.0,
+        1.0,
+    );
+    output.lateral = input.lateral_intensity.x;
+    output.intensity = input.lateral_intensity.y;
+    output.color = input.color;
+    return output;
+}
+
+@fragment
+fn fs_mesh(input: MeshVertexOutput) -> @location(0) vec4<f32> {
+    let distance = abs(input.lateral);
+    let soft_cutoff = 1.0 - smoothstep(0.72, 1.0, distance);
+    let falloff = exp(-3.5 * distance * distance) * soft_cutoff;
+    let alpha = clamp(input.intensity * falloff, 0.0, 0.65);
+    return vec4<f32>(input.color * alpha, alpha);
+}

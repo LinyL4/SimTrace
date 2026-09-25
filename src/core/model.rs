@@ -23,6 +23,8 @@ pub struct TelemetryCapabilities {
     pub handbrake: bool,
     pub track_position: bool,
     pub wheel_slip: bool,
+    /// Per-wheel rotational speed is available (used by F1 MotionEx).
+    pub wheel_speed: bool,
 }
 
 /// Status reported by the game, distinct from momentary ABS/TC intervention.
@@ -104,6 +106,13 @@ pub struct VehicleTelemetry {
     pub handbrake: f32,
     /// Provider-defined normalized wheel slip, RL/RR/FL/FR when available.
     pub wheel_slip: Option<[f32; 4]>,
+    /// Provider-supplied per-wheel speed, RL/RR/FL/FR when available.
+    ///
+    /// Added for the F1 MotionEx lock-up detector, which needs wheel speed to
+    /// confirm a real lock against wheel-slip ratio. Providers without this
+    /// channel leave it `None`. Units are provider-defined (raw F1 MotionEx
+    /// wheel speed; unit is not documented by EA).
+    pub wheel_speed: Option<[f32; 4]>,
     pub assists: DriverAssistStatus,
     pub capabilities: TelemetryCapabilities,
 }

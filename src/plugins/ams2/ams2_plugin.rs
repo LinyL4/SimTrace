@@ -138,6 +138,7 @@ impl GamePlugin for Ams2Plugin {
                 track_position: 0.0,
                 handbrake: 0.0,
                 wheel_slip: None,
+                wheel_speed: None,
                 assists: Default::default(),
                 capabilities: TelemetryCapabilities {
                     throttle: true,

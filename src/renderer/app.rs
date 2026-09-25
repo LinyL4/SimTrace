@@ -52,6 +52,8 @@ struct VisualizationSnapshot {
     latest: Option<crate::core::TelemetryPoint>,
     points: Vec<crate::core::TelemetryPoint>,
     analysis: LapStore,
+    /// Confirmed-lock severity per point, index-aligned with `points`.
+    lock_history: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -114,6 +116,14 @@ pub struct SimTraceApp {
     track_strip_cache: Arc<Mutex<TrackStripCache>>,
     f1_open_hud_cache: Arc<Mutex<crate::renderer::f1_open_hud::F1OpenHudCache>>,
     f1_glow_available: bool,
+    brake_limit_detector: crate::renderer::f1_brake_limit::BrakeLimitDetector,
+    brake_limit_params: crate::renderer::f1_brake_limit::BrakeLimitParams,
+    brake_limit_baseline: crate::renderer::f1_brake_limit::BrakeLimitParams,
+    brake_limit_compare_baseline: bool,
+    brake_limit_last_at: Instant,
+    brake_limit_feedback: crate::renderer::f1_brake_limit::BrakeLimitFeedback,
+    history_glow: crate::renderer::f1_open_hud::HistoryGlowMode,
+    history_trace_layers: crate::renderer::f1_open_hud::HistoryTraceLayers,
 }
 
 impl SimTraceApp {
@@ -136,6 +146,7 @@ impl SimTraceApp {
         let now = Instant::now();
         let f1_glow_available =
             crate::renderer::f1_glow_wgpu::install(cc.wgpu_render_state.as_ref());
+        let brake_limit_baseline = crate::renderer::f1_brake_limit::BrakeLimitParams::default();
         Self {
             settings,
             buffer: Arc::new(TelemetryBuffer::new(std::time::Duration::from_secs(
@@ -164,6 +175,16 @@ impl SimTraceApp {
             track_strip_cache: Arc::new(Mutex::new(Default::default())),
             f1_open_hud_cache: Arc::new(Mutex::new(Default::default())),
             f1_glow_available,
+            brake_limit_detector: crate::renderer::f1_brake_limit::BrakeLimitDetector::new(
+                brake_limit_baseline,
+            ),
+            brake_limit_params: brake_limit_baseline,
+            brake_limit_baseline,
+            brake_limit_compare_baseline: false,
+            brake_limit_last_at: now,
+            brake_limit_feedback: Default::default(),
+            history_glow: Default::default(),
+            history_trace_layers: Default::default(),
         }
     }
 
@@ -220,6 +241,43 @@ impl SimTraceApp {
         self.active_plugin = plugin;
         self.active_provider_config = config;
         self.analysis.lock().unwrap().clear();
+    }
+
+    /// Advance the F1 brake lock-up detector once per visualization tick.
+    fn advance_brake_limit(&mut self, now: Instant) {
+        let dt = now
+            .duration_since(self.brake_limit_last_at)
+            .as_secs_f32()
+            .clamp(0.0, 0.25);
+        self.brake_limit_last_at = now;
+
+        let params = if self.brake_limit_compare_baseline {
+            self.brake_limit_baseline
+        } else {
+            self.brake_limit_params
+        };
+        self.brake_limit_detector.set_params(params);
+
+        let sample = self
+            .visualization_snapshot
+            .latest
+            .as_ref()
+            .map(|point| {
+                let telemetry = &point.telemetry;
+                let slip = telemetry.wheel_slip;
+                let wheel_speed = telemetry.wheel_speed;
+                crate::renderer::f1_brake_limit::WheelSample {
+                    speed_ms: telemetry.speed,
+                    brake: telemetry.brake,
+                    slip_fl: slip.map(|values| values[2]),
+                    slip_fr: slip.map(|values| values[3]),
+                    wheel_speed_fl: wheel_speed.map(|values| values[2]),
+                    wheel_speed_fr: wheel_speed.map(|values| values[3]),
+                }
+            })
+            .unwrap_or_default();
+        self.brake_limit_detector.update(dt, &sample);
+        self.brake_limit_feedback = self.brake_limit_detector.feedback();
     }
 }
 
@@ -287,14 +345,28 @@ impl eframe::App for SimTraceApp {
                     .telemetry
                     .effective_steering_degrees(self.max_steering_angle)
             });
+            let lock_params = if self.brake_limit_compare_baseline {
+                self.brake_limit_baseline
+            } else {
+                self.brake_limit_params
+            };
+            let lock_history =
+                crate::renderer::f1_brake_limit::lock_severity_history(lock_params, &points);
             self.visualization_snapshot = Arc::new(VisualizationSnapshot {
                 latest,
                 points,
                 analysis,
+                lock_history,
             });
             self.visualization_work_since_report += 1;
+            self.advance_brake_limit(now);
         }
         let visualization = Arc::clone(&self.visualization_snapshot);
+        let brake_params = if self.brake_limit_compare_baseline {
+            self.brake_limit_baseline
+        } else {
+            self.brake_limit_params
+        };
         let trace_graph_cache = Arc::clone(&self.trace_graph_cache);
         let track_strip_cache = Arc::clone(&self.track_strip_cache);
         let f1_open_hud_cache = Arc::clone(&self.f1_open_hud_cache);
@@ -547,6 +619,11 @@ impl eframe::App for SimTraceApp {
                                     &self.settings.graph,
                                     self.settings.overlay.opacity,
                                     self.max_steering_angle,
+                                    self.brake_limit_feedback,
+                                    &brake_params,
+                                    &visualization.lock_history,
+                                    self.history_glow,
+                                    self.history_trace_layers,
                                 )
                                 .show(
                                     &mut content_ui,
@@ -647,6 +724,16 @@ impl eframe::App for SimTraceApp {
                             }),
                             &self.analysis,
                             &visualization.analysis,
+                        );
+                        #[cfg(debug_assertions)]
+                        draw_brake_limit_panel(
+                            ui,
+                            &mut self.brake_limit_params,
+                            &mut self.brake_limit_baseline,
+                            &mut self.brake_limit_compare_baseline,
+                            self.brake_limit_feedback,
+                            &mut self.history_glow,
+                            &mut self.history_trace_layers,
                         );
                     });
                     // Re-derive parsed colors in case the color pickers changed them.
@@ -1555,6 +1642,157 @@ fn provider_config(settings: &AppSettings) -> ProviderConfig {
 
 fn is_f1_plugin(plugin: &str) -> bool {
     matches!(plugin, "f1" | "f1_25")
+}
+
+/// Debug-only runtime tuning for the F1 brake lock-up detector. This lives in
+/// the config panel and never becomes part of the HUD composition.
+#[cfg(debug_assertions)]
+fn draw_brake_limit_panel(
+    ui: &mut egui::Ui,
+    params: &mut crate::renderer::f1_brake_limit::BrakeLimitParams,
+    baseline: &mut crate::renderer::f1_brake_limit::BrakeLimitParams,
+    compare_baseline: &mut bool,
+    feedback: crate::renderer::f1_brake_limit::BrakeLimitFeedback,
+    history_glow: &mut crate::renderer::f1_open_hud::HistoryGlowMode,
+    history_trace_layers: &mut crate::renderer::f1_open_hud::HistoryTraceLayers,
+) {
+    egui::CollapsingHeader::new("F1 Brake Limit (debug)")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("History Glow:");
+                ui.selectable_value(
+                    history_glow,
+                    crate::renderer::f1_open_hud::HistoryGlowMode::Continuous,
+                    "Continuous",
+                );
+                ui.selectable_value(
+                    history_glow,
+                    crate::renderer::f1_open_hud::HistoryGlowMode::Legacy,
+                    "Legacy",
+                );
+            });
+            ui.label("History Trace Layers:");
+            ui.horizontal_wrapped(|ui| {
+                use crate::renderer::f1_open_hud::HistoryTraceLayers;
+                for (mode, label) in [
+                    (HistoryTraceLayers::Full, "Full"),
+                    (HistoryTraceLayers::CoreOnly, "Core only"),
+                    (HistoryTraceLayers::HaloOnly, "Halo only"),
+                    (HistoryTraceLayers::NoEndpoint, "No endpoint"),
+                    (HistoryTraceLayers::NoProjection, "No projection"),
+                ] {
+                    ui.selectable_value(history_trace_layers, mode, label);
+                }
+            });
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "State: {}   lock {:.0} ms",
+                    feedback.state.label(),
+                    feedback.lock_duration_ms
+                ))
+                .size(11.0)
+                .color(LABEL_MID),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "FL {:.2}  FR {:.2}  global {:.2}  balance {:+.2}",
+                    feedback.severity_fl,
+                    feedback.severity_fr,
+                    feedback.global_severity,
+                    feedback.balance
+                ))
+                .size(11.0)
+                .monospace()
+                .color(LABEL_MID),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "lock L {:.2}  R {:.2}   pulse {:.2}  burn {:.2}",
+                    feedback.lock_fl, feedback.lock_fr, feedback.pulse, feedback.burn
+                ))
+                .size(11.0)
+                .monospace()
+                .color(LABEL_DIM),
+            );
+
+            ui.add_space(4.0);
+            ui.checkbox(compare_baseline, "A/B compare (use baseline)");
+            ui.add_space(2.0);
+
+            section_header(ui, "DETECTION");
+            ui.add(
+                egui::Slider::new(&mut params.slip_warn_start, 0.05..=0.40)
+                    .text("Slip Warn")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("Earlier <-> Later");
+            ui.add(
+                egui::Slider::new(&mut params.slip_lock_start, 0.20..=0.80)
+                    .text("Slip Lock")
+                    .fixed_decimals(2),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.wheel_warn_ratio, 0.50..=0.95)
+                    .text("Wheel Confirm")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("Sensitive (high) <-> Strict (low)");
+            ui.add(
+                egui::Slider::new(&mut params.sustained_ms, 80.0..=1000.0)
+                    .text("Sustained (ms)")
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("Brief <-> Long");
+
+            section_header(ui, "COLOR");
+            ui.add(
+                egui::Slider::new(&mut params.warning_mix, 0.0..=1.0)
+                    .text("Warning Mix")
+                    .fixed_decimals(2),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.lock_projection_alpha, 0.0..=0.5)
+                    .text("Projection Alpha")
+                    .fixed_decimals(2),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.lock_projection_falloff, 0.0..=1.0)
+                    .text("Projection Falloff")
+                    .fixed_decimals(2),
+            );
+
+            section_header(ui, "RESPONSE");
+            ui.add(
+                egui::Slider::new(&mut params.pulse_strength, 0.0..=2.0)
+                    .text("Pulse Strength")
+                    .fixed_decimals(2),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.burn_strength, 0.0..=1.5)
+                    .text("Burn Strength")
+                    .fixed_decimals(2),
+            );
+            ui.add(
+                egui::Slider::new(&mut params.lock_cyan_strength, 0.0..=2.0)
+                    .text("Lock Cyan Strength")
+                    .fixed_decimals(2),
+            );
+
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Reset to baseline").clicked() {
+                    *params = *baseline;
+                }
+                if ui.button("Current -> Baseline").clicked() {
+                    *baseline = *params;
+                }
+                if ui.button("Baseline -> Current").clicked() {
+                    *params = *baseline;
+                }
+            });
+        });
 }
 
 #[cfg(test)]

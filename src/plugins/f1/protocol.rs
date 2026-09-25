@@ -108,8 +108,17 @@ pub struct DecoderState {
     assists: DriverAssistStatus,
     assists_known: bool,
     last_telemetry_frame: Option<u32>,
+    /// Set once a MotionEx packet is observed in the session. Until then
+    /// CarTelemetry is emitted immediately (unchanged legacy behaviour);
+    /// afterwards CarTelemetry and MotionEx are paired by overall frame.
+    motion_seen: bool,
+    /// Most recent CarTelemetry frame waiting for its MotionEx counterpart.
+    pending_car: Option<(Header, VehicleFields)>,
+    /// Most recent MotionEx frame waiting for its CarTelemetry counterpart.
+    pending_motion: Option<(u32, MotionFields)>,
 }
 
+#[derive(Clone, Copy)]
 pub struct VehicleFields {
     pub speed_kph: u16,
     pub throttle: f32,
@@ -122,6 +131,15 @@ pub struct VehicleFields {
     pub rev_lights_bit_value: u16,
 }
 
+/// Player-only MotionEx channels used by the lock-up detector.
+///
+/// All wheel arrays use the EA order RL, RR, FL, FR.
+#[derive(Clone, Copy, Default)]
+pub struct MotionFields {
+    pub wheel_speed: [f32; 4],
+    pub wheel_slip_ratio: [f32; 4],
+}
+
 impl DecoderState {
     pub fn observe_session(&mut self, uid: u64) {
         if self.session_uid.is_some_and(|previous| previous != uid) {
@@ -131,6 +149,9 @@ impl DecoderState {
             self.assists = DriverAssistStatus::default();
             self.assists_known = false;
             self.last_telemetry_frame = None;
+            self.motion_seen = false;
+            self.pending_car = None;
+            self.pending_motion = None;
         }
         self.session_uid = Some(uid);
     }
@@ -158,24 +179,98 @@ impl DecoderState {
         Ok(())
     }
 
-    pub fn make_telemetry(
+    fn take_motion_for(&mut self, overall_frame: u32) -> Option<MotionFields> {
+        match self.pending_motion {
+            Some((frame, motion)) if frame == overall_frame => {
+                self.pending_motion = None;
+                Some(motion)
+            }
+            _ => None,
+        }
+    }
+
+    /// Feed one CarTelemetry sample. Returns a merged [`TelemetryData`] when a
+    /// complete session/frame pair is available.
+    pub fn push_car(
         &mut self,
         format: u16,
         header: Header,
         fields: VehicleFields,
     ) -> Result<Option<TelemetryData>> {
-        if self
-            .last_telemetry_frame
-            .is_some_and(|last| header.overall_frame_identifier <= last)
-        {
-            return Ok(None);
-        }
         if !fields.throttle.is_finite() || !fields.steer.is_finite() || !fields.brake.is_finite() {
             return Err(reject(
                 RejectReason::InvalidValue,
                 "non-finite F1 telemetry input",
             ));
         }
+        if self
+            .last_telemetry_frame
+            .is_some_and(|last| header.overall_frame_identifier <= last)
+        {
+            return Ok(None);
+        }
+
+        if !self.motion_seen {
+            let motion = self.take_motion_for(header.overall_frame_identifier);
+            return self.finish(format, header, fields, motion).map(Some);
+        }
+
+        if let Some((pending_header, pending_fields)) = self.pending_car.take() {
+            if pending_header.overall_frame_identifier == header.overall_frame_identifier {
+                // Duplicate CarTelemetry for the held frame: keep the newest.
+                self.pending_car = Some((header, fields));
+                if let Some(motion) = self.take_motion_for(header.overall_frame_identifier) {
+                    let (held_header, held_fields) = self
+                        .pending_car
+                        .take()
+                        .expect("pending car was just set");
+                    return self
+                        .finish(format, held_header, held_fields, Some(motion))
+                        .map(Some);
+                }
+                return Ok(None);
+            }
+            // Emit the older held frame, then hold this newer one.
+            let motion = self.take_motion_for(pending_header.overall_frame_identifier);
+            let emitted = self.finish(format, pending_header, pending_fields, motion)?;
+            self.pending_car = Some((header, fields));
+            return Ok(Some(emitted));
+        }
+
+        if let Some(motion) = self.take_motion_for(header.overall_frame_identifier) {
+            return self.finish(format, header, fields, Some(motion)).map(Some);
+        }
+        self.pending_car = Some((header, fields));
+        Ok(None)
+    }
+
+    /// Feed one player-only MotionEx sample. Returns a merged [`TelemetryData`]
+    /// when it completes a held CarTelemetry frame.
+    pub fn observe_motion(
+        &mut self,
+        format: u16,
+        header: &Header,
+        motion: MotionFields,
+    ) -> Result<Option<TelemetryData>> {
+        self.motion_seen = true;
+        self.pending_motion = Some((header.overall_frame_identifier, motion));
+        if let Some((car_header, car_fields)) = self.pending_car.take() {
+            if car_header.overall_frame_identifier == header.overall_frame_identifier {
+                let motion = self.pending_motion.take().map(|(_, motion)| motion);
+                return self.finish(format, car_header, car_fields, motion).map(Some);
+            }
+            self.pending_car = Some((car_header, car_fields));
+        }
+        Ok(None)
+    }
+
+    fn finish(
+        &mut self,
+        format: u16,
+        header: Header,
+        fields: VehicleFields,
+        motion: Option<MotionFields>,
+    ) -> Result<TelemetryData> {
         let track_position = match (self.player_lap_distance_m, self.track_length_m) {
             (Some(distance), Some(length)) if length > 0.0 => {
                 Some((distance / length).rem_euclid(1.0))
@@ -184,8 +279,9 @@ impl DecoderState {
         };
         self.last_telemetry_frame = Some(header.overall_frame_identifier);
         let discontinuity = std::mem::take(&mut self.pending_discontinuity);
+        let has_wheel = motion.is_some();
 
-        Ok(Some(TelemetryData {
+        Ok(TelemetryData {
             timestamp: (header.session_time.max(0.0) * 1000.0) as u64,
             vehicle: VehicleTelemetry {
                 throttle: fields.throttle.clamp(0.0, 1.0),
@@ -205,7 +301,8 @@ impl DecoderState {
                 tc_active: false,
                 track_position: track_position.unwrap_or(0.0),
                 handbrake: 0.0,
-                wheel_slip: None,
+                wheel_slip: motion.map(|motion| motion.wheel_slip_ratio),
+                wheel_speed: motion.map(|motion| motion.wheel_speed),
                 assists: self
                     .assists_known
                     .then_some(self.assists)
@@ -219,6 +316,8 @@ impl DecoderState {
                     gear: true,
                     rpm: true,
                     track_position: track_position.is_some(),
+                    wheel_slip: has_wheel,
+                    wheel_speed: has_wheel,
                     ..Default::default()
                 },
             },
@@ -231,7 +330,7 @@ impl DecoderState {
                 packet_time_seconds: Some(header.session_time),
                 discontinuity,
             },
-        }))
+        })
     }
 }
 
@@ -359,4 +458,14 @@ pub fn read_f32(bytes: &[u8], offset: usize) -> Result<f32> {
         .get(offset..offset + 4)
         .ok_or_else(|| reject(RejectReason::PayloadField, "truncated F1 f32"))?;
     Ok(f32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+/// Read a `float[4]` from `offset`, preserving the on-wire order.
+pub fn read_arr4(bytes: &[u8], offset: usize) -> Result<[f32; 4]> {
+    Ok([
+        read_f32(bytes, offset)?,
+        read_f32(bytes, offset + 4)?,
+        read_f32(bytes, offset + 8)?,
+        read_f32(bytes, offset + 12)?,
+    ])
 }

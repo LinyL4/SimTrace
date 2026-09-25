@@ -1,6 +1,6 @@
 [package]
 name = "simtrace"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Sim racing telemetry visualization tool"
 authors = ["SimTrace Contributors"]

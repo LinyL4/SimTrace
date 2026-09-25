@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::core::TelemetryData;
 
-use super::protocol::{self, DecoderState, VehicleFields, HEADER_LEN};
+use super::protocol::{self, DecoderState, MotionFields, VehicleFields, HEADER_LEN};
 
 pub const PACKET_FORMAT: u16 = 2025;
 const GAME_YEARS: &[u8] = &[25];
@@ -20,6 +20,11 @@ const PACKET_SESSION: u8 = 1;
 const PACKET_LAP_DATA: u8 = 2;
 const PACKET_CAR_TELEMETRY: u8 = 6;
 const PACKET_CAR_STATUS: u8 = 7;
+const PACKET_MOTION_EX: u8 = 13;
+const MOTION_EX_PACKET_LEN: usize = 273;
+// MotionEx is player-only; offsets are from the end of the shared header.
+const MX_WHEEL_SPEED_OFFSET: usize = HEADER_LEN + 48;
+const MX_WHEEL_SLIP_RATIO_OFFSET: usize = HEADER_LEN + 64;
 
 #[derive(Default)]
 pub struct Decoder {
@@ -57,7 +62,7 @@ impl Decoder {
                 protocol::require_packet(bytes, CAR_TELEMETRY_PACKET_LEN, header.packet_version)?;
                 let base =
                     protocol::player_offset(header.player_car_index, CAR_TELEMETRY_DATA_LEN)?;
-                self.state.make_telemetry(
+                self.state.push_car(
                     PACKET_FORMAT,
                     header,
                     VehicleFields {
@@ -74,6 +79,14 @@ impl Decoder {
                         rev_lights_bit_value: protocol::read_u16(bytes, base + 20)?,
                     },
                 )
+            }
+            PACKET_MOTION_EX => {
+                protocol::require_packet(bytes, MOTION_EX_PACKET_LEN, header.packet_version)?;
+                let motion = MotionFields {
+                    wheel_speed: protocol::read_arr4(bytes, MX_WHEEL_SPEED_OFFSET)?,
+                    wheel_slip_ratio: protocol::read_arr4(bytes, MX_WHEEL_SLIP_RATIO_OFFSET)?,
+                };
+                self.state.observe_motion(PACKET_FORMAT, &header, motion)
             }
             _ => Ok(None),
         }
@@ -114,6 +127,29 @@ fn test_packet(id: u8, len: usize, player: usize, frame: u32) -> Vec<u8> {
     bytes[23..27].copy_from_slice(&frame.to_le_bytes());
     bytes[27] = player as u8;
     bytes[28] = 255;
+    bytes
+}
+
+#[cfg(test)]
+fn test_motion_ex_packet(frame: u32, slip: [f32; 4], wheel: [f32; 4]) -> Vec<u8> {
+    let mut bytes = vec![0_u8; MOTION_EX_PACKET_LEN];
+    bytes[0..2].copy_from_slice(&PACKET_FORMAT.to_le_bytes());
+    bytes[2] = GAME_YEARS[0];
+    bytes[5] = 1;
+    bytes[6] = PACKET_MOTION_EX;
+    bytes[7..15].copy_from_slice(&1234_u64.to_le_bytes());
+    bytes[15..19].copy_from_slice(&12.5_f32.to_le_bytes());
+    bytes[19..23].copy_from_slice(&frame.to_le_bytes());
+    bytes[23..27].copy_from_slice(&frame.to_le_bytes());
+    bytes[27] = 0;
+    let put = |bytes: &mut [u8], offset: usize, values: [f32; 4]| {
+        for (index, value) in values.iter().enumerate() {
+            let at = offset + index * 4;
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    };
+    put(&mut bytes, MX_WHEEL_SPEED_OFFSET, wheel);
+    put(&mut bytes, MX_WHEEL_SLIP_RATIO_OFFSET, slip);
     bytes
 }
 
@@ -174,5 +210,73 @@ mod tests {
         assert_eq!(data.vehicle.track_position, 0.25);
         assert_eq!(data.vehicle.assists.abs_enabled, Some(true));
         assert_eq!(data.vehicle.assists.traction_control_level, Some(2));
+    }
+
+    #[test]
+    fn motion_ex_wheel_data_enters_telemetry_after_car_telemetry() {
+        let mut decoder = Decoder::default();
+        // Engage MotionEx pairing.
+        assert!(decoder
+            .decode(&test_motion_ex_packet(1, [0.0; 4], [0.0; 4]))
+            .unwrap()
+            .is_none());
+        // CarTelemetry arrives first and is held.
+        assert!(decoder
+            .decode(&test_telemetry_packet(0, 2))
+            .unwrap()
+            .is_none());
+        // MotionEx for the same frame completes and merges.
+        let data = decoder
+            .decode(&test_motion_ex_packet(
+                2,
+                [-0.1, -0.2, -0.8, -0.9],
+                [11.0, 12.0, 13.0, 14.0],
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.vehicle.wheel_slip, Some([-0.1, -0.2, -0.8, -0.9]));
+        assert_eq!(data.vehicle.wheel_speed, Some([11.0, 12.0, 13.0, 14.0]));
+        assert!(data.vehicle.capabilities.wheel_slip);
+        assert!(data.vehicle.capabilities.wheel_speed);
+    }
+
+    #[test]
+    fn motion_ex_before_car_telemetry_merges_out_of_order() {
+        let mut decoder = Decoder::default();
+        assert!(decoder
+            .decode(&test_motion_ex_packet(
+                5,
+                [1.0, 2.0, 3.0, 4.0],
+                [5.0, 6.0, 7.0, 8.0],
+            ))
+            .unwrap()
+            .is_none());
+        let data = decoder
+            .decode(&test_telemetry_packet(0, 5))
+            .unwrap()
+            .unwrap();
+        // EA wheel order RL, RR, FL, FR is preserved verbatim.
+        assert_eq!(data.vehicle.wheel_slip, Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(data.vehicle.wheel_speed, Some([5.0, 6.0, 7.0, 8.0]));
+    }
+
+    #[test]
+    fn motion_ex_does_not_mix_frames() {
+        let mut decoder = Decoder::default();
+        assert!(decoder
+            .decode(&test_motion_ex_packet(10, [9.0; 4], [9.0; 4]))
+            .unwrap()
+            .is_none());
+        // CarTelemetry frame 11 must not adopt MotionEx frame 10.
+        assert!(decoder
+            .decode(&test_telemetry_packet(0, 11))
+            .unwrap()
+            .is_none());
+        let data = decoder
+            .decode(&test_motion_ex_packet(11, [1.0; 4], [2.0; 4]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.vehicle.wheel_slip, Some([1.0; 4]));
+        assert_eq!(data.vehicle.wheel_speed, Some([2.0; 4]));
     }
 }

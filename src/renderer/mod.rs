@@ -1,6 +1,7 @@
 //! egui renderer for telemetry visualization
 
 pub mod app;
+pub mod f1_brake_limit;
 pub mod f1_glow_wgpu;
 pub mod f1_open_hud;
 pub mod lap_comparison;

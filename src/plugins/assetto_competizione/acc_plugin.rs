@@ -96,6 +96,7 @@ impl GamePlugin for AccPlugin {
             track_position: graphics.normalized_car_position,
             handbrake: 0.0,
             wheel_slip: None,
+            wheel_speed: None,
             assists: Default::default(),
             capabilities: TelemetryCapabilities {
                 throttle: true,
